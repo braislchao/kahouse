@@ -11,6 +11,17 @@ import (
 
 const confluentMagicByte byte = 0x0
 
+var avroPrimitiveUnionBranches = map[string]struct{}{
+	"null":    {},
+	"boolean": {},
+	"int":     {},
+	"long":    {},
+	"float":   {},
+	"double":  {},
+	"bytes":   {},
+	"string":  {},
+}
+
 type AvroDecoder struct {
 	client schemaregistry.Client
 
@@ -48,7 +59,56 @@ func (d *AvroDecoder) Decode(topic string, payload []byte) (map[string]interface
 	if !ok {
 		return nil, fmt.Errorf("decoded Avro payload was %T, want map[string]interface{}", record)
 	}
-	return m, nil
+	result := normalizeAvroValue(m)
+	normalized, ok := result.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("normalized Avro payload was %T, want map[string]interface{}", result)
+	}
+	return normalized, nil
+}
+
+// normalizeAvroValue recursively unwraps goavro union wrappers.
+// For unions like ["null", "string"], goavro decodes values as map[string]interface{}{"string": "..."}.
+func normalizeAvroValue(v interface{}) interface{} {
+	switch value := v.(type) {
+	case map[string]interface{}:
+		if len(value) == 1 {
+			for branch, inner := range value {
+				if isAvroUnionBranch(branch) {
+					if branch == "null" {
+						return nil
+					}
+					return normalizeAvroValue(inner)
+				}
+			}
+		}
+		normalized := make(map[string]interface{}, len(value))
+		for k, inner := range value {
+			normalized[k] = normalizeAvroValue(inner)
+		}
+		return normalized
+	case []interface{}:
+		normalized := make([]interface{}, len(value))
+		for i, inner := range value {
+			normalized[i] = normalizeAvroValue(inner)
+		}
+		return normalized
+	default:
+		return value
+	}
+}
+
+func isAvroUnionBranch(branch string) bool {
+	if _, ok := avroPrimitiveUnionBranches[branch]; ok {
+		return true
+	}
+	// Named union branches are schema full names (commonly dot-qualified).
+	for i := 0; i < len(branch); i++ {
+		if branch[i] == '.' {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *AvroDecoder) codecFor(topic string, schemaID int) (*goavro.Codec, error) {

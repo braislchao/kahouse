@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"go.uber.org/zap"
 )
@@ -14,6 +15,25 @@ import (
 // embedded backticks to prevent SQL injection via column or table names.
 func quoteIdentifier(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+// quoteTableIdentifier quotes each table path segment (e.g. db.table -> `db`.`table`).
+// Returns an error if the name is empty or contains empty segments (e.g. "db..table").
+func quoteTableIdentifier(name string) (string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", fmt.Errorf("table name is empty")
+	}
+	parts := strings.Split(trimmed, ".")
+	quoted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return "", fmt.Errorf("table name %q contains empty segment", name)
+		}
+		quoted = append(quoted, quoteIdentifier(part))
+	}
+	return strings.Join(quoted, "."), nil
 }
 
 // writeBatch writes a batch of records to a ClickHouse table.
@@ -40,7 +60,15 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 	for i, col := range columns {
 		quoted[i] = quoteIdentifier(col)
 	}
-	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES", quoteIdentifier(table), strings.Join(quoted, ", "))
+	ctx = clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
+		"async_insert":          1,
+		"wait_for_async_insert": 1,
+	}))
+	quotedTable, err := quoteTableIdentifier(table)
+	if err != nil {
+		return fmt.Errorf("invalid table name: %w", err)
+	}
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES", quotedTable, strings.Join(quoted, ", "))
 	batchStmt, err := chConn.PrepareBatch(ctx, insertSQL)
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch insert: %w", err)

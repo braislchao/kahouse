@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,11 +44,11 @@ func NewSinkTask(
 	}
 
 	// Each topic gets a unique consumer group for full offset isolation.
-	groupID := cfg.GroupID + "-" + mapping.Topic
+	groupID := "kahouse-" + strings.TrimSpace(cfg.GroupID) + "-" + mapping.Topic
 	kafkaConfig := buildKafkaConfig(kafka.ConfigMap{
 		"bootstrap.servers":  cfg.KafkaBrokers,
 		"group.id":           groupID,
-		"auto.offset.reset":  "earliest",
+		"auto.offset.reset":  "latest",
 		"enable.auto.commit": false,
 	}, cfg)
 
@@ -191,13 +192,33 @@ func (t *SinkTask) batchProcessor(ctx context.Context, wg *sync.WaitGroup) {
 		if len(batch) == 0 {
 			return true
 		}
+		flushStart := time.Now()
+		queueDepthBefore := len(t.msgChan)
+		t.sugar.Infow(
+			"Flushing batch",
+			"batch_size", len(batch),
+			"queue_depth_before", queueDepthBefore,
+			"batch_age_ms", time.Since(firstInBatch).Milliseconds(),
+		)
 		flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer flushCancel()
 		if err := t.writeAndCommitBatch(flushCtx, batch, firstInBatch); err != nil {
-			t.sugar.Errorf("Failed to write and commit batch: %v", err)
+			t.sugar.Errorw(
+				"Failed to write and commit batch",
+				"error", err,
+				"batch_size", len(batch),
+				"flush_duration_ms", time.Since(flushStart).Milliseconds(),
+				"queue_depth_after", len(t.msgChan),
+			)
 			t.cancel()
 			return false
 		}
+		t.sugar.Infow(
+			"Batch flush completed",
+			"batch_size", len(batch),
+			"flush_duration_ms", time.Since(flushStart).Milliseconds(),
+			"queue_depth_after", len(t.msgChan),
+		)
 		batch = nil
 		firstInBatch = time.Time{}
 		return true
@@ -205,10 +226,6 @@ func (t *SinkTask) batchProcessor(ctx context.Context, wg *sync.WaitGroup) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			t.sugar.Info("Batch processor shutting down, flushing remaining messages")
-			flush()
-			return
 		case msg, ok := <-t.msgChan:
 			if !ok {
 				t.sugar.Info("Message channel closed, flushing remaining messages")
@@ -294,18 +311,27 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 		if attempt > 0 {
 			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Duration(*t.mapping.RetryBackoffMs) * time.Millisecond
 			jitter := time.Duration(float64(backoff) * (float64(rand.Intn(101)) / 100.0))
-			time.Sleep(backoff + jitter)
-			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, backoff+jitter)
+			wait := backoff + jitter
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err(), attempt
+			}
+			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, wait)
 		}
 		if err := writeBatch(ctx, table, t.chConn, batch, t.sugar); err != nil {
 			if attempt == maxRetries {
+				t.sugar.Errorf("Batch write failed on final attempt %d/%d: %v", attempt+1, maxRetries+1, err)
 				return err, attempt + 1
 			}
+			t.sugar.Warnf("Batch write failed on attempt %d/%d: %v", attempt+1, maxRetries+1, err)
 			continue
 		}
-		return nil, attempt
+		return nil, attempt + 1
 	}
-	return nil, 0 // unreachable
+	return fmt.Errorf("writeWithRetries: no attempts made (maxRetries=%d)", maxRetries), 0
 }
 
 // extractOffsets returns the next offset to commit (max consumed offset + 1) for each partition.

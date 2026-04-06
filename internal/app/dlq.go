@@ -37,7 +37,8 @@ func sendBatchToDLQ(producer *kafka.Producer, topic string, dlqSuffix string, ba
 		}
 	}
 
-	// Wait for all delivery confirmations.
+	// Wait for all delivery confirmations with a single deadline for the entire batch.
+	deadline := time.After(dlqDeliveryTimeout)
 	for range len(batch) {
 		select {
 		case event := <-deliveryChan:
@@ -48,8 +49,8 @@ func sendBatchToDLQ(producer *kafka.Producer, topic string, dlqSuffix string, ba
 			if msg.TopicPartition.Error != nil {
 				return fmt.Errorf("DLQ delivery failed: %w", msg.TopicPartition.Error)
 			}
-		case <-time.After(dlqDeliveryTimeout):
-			return fmt.Errorf("timed out waiting for DLQ delivery after %s", dlqDeliveryTimeout)
+		case <-deadline:
+			return fmt.Errorf("timed out waiting for DLQ batch delivery after %s", dlqDeliveryTimeout)
 		}
 	}
 	return nil

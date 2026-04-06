@@ -236,6 +236,9 @@ func validateConfig(cfg *Config) error {
 	if strings.TrimSpace(cfg.GroupID) == "" {
 		return fmt.Errorf("group_id is required")
 	}
+	if strings.TrimSpace(cfg.DLQTopicSuffix) == "" {
+		return fmt.Errorf("dlq_topic_suffix is required and must not be empty")
+	}
 	if cfg.InputFormat == "string" && cfg.StringValueColumn == "" {
 		return fmt.Errorf("string_value_column is required when input_format is string")
 	}
@@ -256,13 +259,14 @@ func validateConfig(cfg *Config) error {
 	}
 	seenTopics := make(map[string]int, len(cfg.TopicTables))
 	for i, tt := range cfg.TopicTables {
-		if prev, exists := seenTopics[tt.Topic]; exists {
-			return fmt.Errorf("topic_tables[%d]: duplicate topic %q (first defined at index %d)", i, tt.Topic, prev)
-		}
-		seenTopics[tt.Topic] = i
-		if strings.TrimSpace(tt.Topic) == "" {
+		trimmedTopic := strings.TrimSpace(tt.Topic)
+		if trimmedTopic == "" {
 			return fmt.Errorf("topic_tables[%d]: topic is required", i)
 		}
+		if prev, exists := seenTopics[trimmedTopic]; exists {
+			return fmt.Errorf("topic_tables[%d]: duplicate topic %q (first defined at index %d)", i, trimmedTopic, prev)
+		}
+		seenTopics[trimmedTopic] = i
 		if strings.TrimSpace(tt.Table) == "" {
 			return fmt.Errorf("topic_tables[%d]: table is required", i)
 		}

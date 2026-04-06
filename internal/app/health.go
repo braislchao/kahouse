@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
@@ -43,7 +44,9 @@ func (h *Health) Livez(w http.ResponseWriter, r *http.Request) {
 
 // Readyz handler returns 200 if the service is ready to serve traffic
 func (h *Health) Readyz(w http.ResponseWriter, r *http.Request) {
-	if err := h.readinessError(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.readinessError(ctx); err != nil {
 		h.logger.Warnf("Readiness check failed: %v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte("Not Ready: " + err.Error()))

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
@@ -38,8 +39,9 @@ func Run() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigChan
-		sugar.Info("Received shutdown signal")
+		sig := <-sigChan
+		sugar.Infof("Received shutdown signal: %v", sig)
+		signal.Stop(sigChan)
 		cancel()
 	}()
 
@@ -118,9 +120,10 @@ func Run() {
 	RegisterHealthEndpoints(health, mux)
 
 	addr := fmt.Sprintf(":%d", cfg.MetricsPort)
+	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
 		sugar.Infof("Starting metrics and health server on %s", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			sugar.Errorf("Metrics/health server failed: %v — triggering shutdown", err)
 			cancel()
 		}
@@ -128,5 +131,12 @@ func Run() {
 
 	sugar.Info("All sink tasks started, waiting for shutdown signal")
 	wg.Wait()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		sugar.Errorf("Metrics/health server shutdown error: %v", err)
+	}
+
 	sugar.Info("All sink tasks stopped, exiting")
 }

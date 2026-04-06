@@ -24,6 +24,7 @@ func validConfig() Config {
 		SchemaRegistry: "http://localhost:8081",
 		ClickHouseDSN:  "tcp://localhost:9000",
 		GroupID:        "group",
+		DLQTopicSuffix: ".dlq",
 		BatchSize:      1,
 		BatchDelayMs:   1,
 		MaxRetries:     1,
@@ -263,6 +264,11 @@ func TestValidateConfigRejectsInvalidNumbers(t *testing.T) {
 			want:   "max_retries must be >= 0",
 		},
 		{
+			name:   "empty dlq suffix",
+			mutate: func(c *Config) { c.DLQTopicSuffix = "" },
+			want:   "dlq_topic_suffix is required and must not be empty",
+		},
+		{
 			name:   "topic batch size",
 			mutate: func(c *Config) { c.TopicTables[0].BatchSize = intPtr(0) },
 			want:   "topic_tables[0]: batch_size must be at least 1",
@@ -487,6 +493,98 @@ func TestNormalizeInputFormat(t *testing.T) {
 	}
 }
 
+func TestQuoteTableIdentifier(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{name: "single table", in: "events", want: "`events`"},
+		{name: "db and table", in: "analytics.events", want: "`analytics`.`events`"},
+		{name: "trim spaces", in: " analytics . events ", want: "`analytics`.`events`"},
+		{name: "escaped backticks", in: "db.we`ird", want: "`db`.`we``ird`"},
+		{name: "empty string", in: "", wantErr: true},
+		{name: "double dot", in: "db..table", wantErr: true},
+		{name: "leading dot", in: ".table", wantErr: true},
+		{name: "trailing dot", in: "db.", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := quoteTableIdentifier(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Expected error for input %q, got %q", tt.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error for input %q: %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Fatalf("Expected quoted table identifier %q, got %q", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestNormalizeAvroValueUnwrapsPrimitiveUnion(t *testing.T) {
+	input := map[string]interface{}{
+		"access_id": map[string]interface{}{"string": "abc-123"},
+		"metadata":  map[string]interface{}{"null": nil},
+		"nested": map[string]interface{}{
+			"items": []interface{}{
+				map[string]interface{}{"int": int32(7)},
+				map[string]interface{}{"string": "x"},
+			},
+		},
+	}
+
+	got, ok := normalizeAvroValue(input).(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected normalized value to be map, got %T", normalizeAvroValue(input))
+	}
+
+	if got["access_id"] != "abc-123" {
+		t.Fatalf("Expected access_id to unwrap to string, got %#v", got["access_id"])
+	}
+	if got["metadata"] != nil {
+		t.Fatalf("Expected metadata to unwrap to nil, got %#v", got["metadata"])
+	}
+	nested, ok := got["nested"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected nested to remain object, got %T", got["nested"])
+	}
+	items, ok := nested["items"].([]interface{})
+	if !ok || len(items) != 2 {
+		t.Fatalf("Expected nested items slice of len 2, got %#v", nested["items"])
+	}
+	if items[0] != int32(7) {
+		t.Fatalf("Expected first item to unwrap to int32(7), got %#v", items[0])
+	}
+	if items[1] != "x" {
+		t.Fatalf("Expected second item to unwrap to string x, got %#v", items[1])
+	}
+}
+
+func TestNormalizeAvroValueKeepsRegularObjects(t *testing.T) {
+	input := map[string]interface{}{
+		"access_id": map[string]interface{}{"value": "abc-123"},
+	}
+	got, ok := normalizeAvroValue(input).(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected normalized value to be map, got %T", normalizeAvroValue(input))
+	}
+	inner, ok := got["access_id"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected non-union map to stay map, got %T", got["access_id"])
+	}
+	if inner["value"] != "abc-123" {
+		t.Fatalf("Expected non-union map contents to stay intact, got %#v", inner)
+	}
+}
+
 func TestAnyTopicUsesFormat(t *testing.T) {
 	cfg := &Config{
 		InputFormat: "json",
@@ -503,6 +601,28 @@ func TestAnyTopicUsesFormat(t *testing.T) {
 	}
 	if anyTopicUsesFormat(cfg, "string") {
 		t.Fatal("Did not expect string format to be detected")
+	}
+}
+
+func TestConsumerGroupIDFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		groupID string
+		topic   string
+		want    string
+	}{
+		{name: "adds static kahouse prefix", groupID: "prod", topic: "orders", want: "kahouse-prod-orders"},
+		{name: "keeps configured value as middle segment", groupID: "kahouse-main", topic: "orders", want: "kahouse-kahouse-main-orders"},
+		{name: "trims spaces", groupID: "  prod  ", topic: "orders", want: "kahouse-prod-orders"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := "kahouse-" + strings.TrimSpace(tt.groupID) + "-" + tt.topic
+			if got != tt.want {
+				t.Fatalf("Expected group id %q, got %q", tt.want, got)
+			}
+		})
 	}
 }
 
@@ -709,4 +829,3 @@ func TestHealthReadinessError(t *testing.T) {
 		})
 	}
 }
-
