@@ -1,0 +1,188 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    hostname: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 | grep Mode"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    hostname: schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:29092'
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    hostname: clickhouse
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  create-resources:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    environment:
+      KAHOUSE_INPUT_FORMAT: ${KAHOUSE_INPUT_FORMAT:-avro}
+    command: >-
+      kafka-topics --bootstrap-server kafka:29092 --create --topic test --partitions 3 --replication-factor 1 --if-not-exists &&
+      kafka-topics --bootstrap-server kafka:29092 --create --topic orders --partitions 3 --replication-factor 1 --if-not-exists &&
+      kafka-topics --bootstrap-server kafka:29092 --create --topic payments --partitions 3 --replication-factor 1 --if-not-exists &&
+      if [ "$$KAHOUSE_INPUT_FORMAT" = "avro" ]; then sleep 5 &&
+      curl -X POST -H 'Content-Type: application/vnd.schemaregistry.v1+json' --data '{"schema": "{\"type\":\"record\",\"name\":\"TestRecord\",\"namespace\":\"com.example\",\"fields\":[{\"name\":\"id\",\"type\":\"int\"},{\"name\":\"name\",\"type\":\"string\"},{\"name\":\"value\",\"type\":\"double\"},{\"name\":\"timestamp\",\"type\":\"long\"}]}"}' http://schema-registry:8081/subjects/test-value/versions &&
+      curl -X POST -H 'Content-Type: application/vnd.schemaregistry.v1+json' --data '{"schema": "{\"type\":\"record\",\"name\":\"OrderRecord\",\"namespace\":\"com.example\",\"fields\":[{\"name\":\"id\",\"type\":\"int\"},{\"name\":\"name\",\"type\":\"string\"},{\"name\":\"value\",\"type\":\"double\"},{\"name\":\"timestamp\",\"type\":\"long\"}]}"}' http://schema-registry:8081/subjects/orders-value/versions &&
+      curl -X POST -H 'Content-Type: application/vnd.schemaregistry.v1+json' --data '{"schema": "{\"type\":\"record\",\"name\":\"PaymentRecord\",\"namespace\":\"com.example\",\"fields\":[{\"name\":\"id\",\"type\":\"int\"},{\"name\":\"name\",\"type\":\"string\"},{\"name\":\"value\",\"type\":\"double\"},{\"name\":\"timestamp\",\"type\":\"long\"}]}"}' http://schema-registry:8081/subjects/payments-value/versions; fi &&
+      echo 'Resources created successfully!'
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-lc"]
+    environment:
+      KAHOUSE_INPUT_FORMAT: ${KAHOUSE_INPUT_FORMAT:-avro}
+      KAHOUSE_STRING_VALUE_COLUMN: ${KAHOUSE_STRING_VALUE_COLUMN:-value}
+    command: >-
+      if [ "$$KAHOUSE_INPUT_FORMAT" = "string" ]; then
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test ($$KAHOUSE_STRING_VALUE_COLUMN String, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders ($$KAHOUSE_STRING_VALUE_COLUMN String, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments ($$KAHOUSE_STRING_VALUE_COLUMN String, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192";
+      elif [ "$$KAHOUSE_INPUT_FORMAT" = "json" ]; then
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192";
+      else
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192";
+      fi &&
+      echo 'ClickHouse tables created successfully!'
+
+  kahouse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      KAHOUSE_KAFKA_BROKERS: kafka:29092
+      KAHOUSE_SCHEMA_REGISTRY: http://schema-registry:8081
+      KAHOUSE_CLICKHOUSE_DSN: tcp://clickhouse:9000?debug=false
+      KAHOUSE_GROUP_ID: kahouse
+      KAHOUSE_INPUT_FORMAT: ${KAHOUSE_INPUT_FORMAT:-avro}
+      KAHOUSE_STRING_VALUE_COLUMN: ${KAHOUSE_STRING_VALUE_COLUMN:-value}
+      KAHOUSE_BATCH_SIZE: 100
+      KAHOUSE_BATCH_DELAY_MS: 1000
+      KAHOUSE_DLQ_TOPIC_SUFFIX: .dlq
+      KAHOUSE_MAX_RETRIES: 3
+      KAHOUSE_RETRY_BACKOFF_MS: 100
+      KAHOUSE_TOPIC_TABLES: ${KAHOUSE_TOPIC_TABLES}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  test-producer:
+    image: ${TEST_PRODUCER_IMAGE:-confluentinc/cp-schema-registry:7.6.0}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      kahouse:
+        condition: service_healthy
+    volumes:
+      - ./scripts/test-producer.sh:/tmp/test-producer.sh:ro
+    environment:
+      TEST_INPUT_FORMAT: ${TEST_INPUT_FORMAT:-avro}
+      TEST_MESSAGE_COUNT: ${TEST_MESSAGE_COUNT:-20}
+      TEST_TOPIC_FILTER: ${TEST_TOPIC_FILTER:-}
+    entrypoint: ["/bin/bash", "/tmp/test-producer.sh"]
+
+  clickhouse-ui:
+    image: spoonest/clickhouse-web-ui:latest
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CH_HOSTS: clickhouse
+      CH_PORT: 8123
+      CH_USER: default
+      CH_PASSWORD: ""
+
+volumes:
+  clickhouse_data:
+    driver: local
+  clickhouse_logs:
+    driver: local
+
+networks:
+  default:
+    name: kahouse-network

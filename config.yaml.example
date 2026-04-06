@@ -1,0 +1,63 @@
+# kahouse Configuration Example
+# Copy to config.yaml and modify as needed
+
+kafka_brokers: "localhost:9092"
+schema_registry: "http://localhost:8081"
+clickhouse_dsn: "tcp://localhost:9000"
+group_id: "kahouse"
+dlq_topic_suffix: ".dlq"
+input_format: "avro"           # avro | json | string
+string_value_column: "value"   # used only when input_format is string
+
+# Kafka authentication (optional — omit all fields for unauthenticated clusters)
+# Typical values for Confluent Cloud or MSK:
+# kafka_security_protocol: "SASL_SSL"
+# kafka_sasl_mechanism: "PLAIN"          # or SCRAM-SHA-256 / SCRAM-SHA-512
+# kafka_sasl_username: "your-api-key"
+# kafka_sasl_password: "your-api-secret"
+# kafka_ssl_ca_location: "/path/to/ca.crt"  # only needed for custom CA
+
+# Server settings
+metrics_port: 9090
+
+# Global defaults (can be overridden per topic)
+batch_size: 10000
+batch_delay_ms: 200
+max_retries: 3
+retry_backoff_ms: 100
+
+# For avro input, schema_registry must point at a Confluent-compatible Schema Registry.
+# For json and string input, schema_registry is unused.
+
+# Topic-to-table mappings (required — at least one entry must be present).
+# Each topic gets its own Kafka consumer and independent batch pipeline.
+topic_tables:
+  - topic: "orders"
+    table: "default.orders"
+    format: "json"
+    # Optional per-topic overrides. Omit a field to inherit the global default above.
+    # Setting a field to 0 is valid and takes effect — 0 is not treated as "not set".
+    # Examples:
+    # format: "avro"
+    # string_value_column: "value"
+    # batch_size: 5000
+    # batch_delay_ms: 100
+    # max_retries: 5
+    # retry_backoff_ms: 200
+
+  - topic: "payments"
+    table: "default.payments"
+    format: "string"
+    string_value_column: "value"
+
+  - topic: "users"
+    table: "default.users"
+    format: "avro"
+    # max_retries: 0        # fail directly to DLQ, no retries
+    # batch_delay_ms: 0     # flush as fast as possible, no accumulation delay
+
+# Input format notes:
+# - avro: ClickHouse columns should match the Avro schema fields.
+# - json: JSON objects are decoded generically; integers arrive as Int64 and decimals as Float64.
+# - string: create a String column matching string_value_column, for example `value String`.
+# Global input_format acts as the default when a topic mapping omits format.
