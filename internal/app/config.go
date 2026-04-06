@@ -91,18 +91,25 @@ func (m *TopicTableMapping) resolve(cfg *Config) {
 // defaults holds the default configuration values.
 // topic_tables has no default entry — an explicit mapping is required.
 var defaults = map[string]interface{}{
-	"kafka_brokers":       "localhost:9092",
-	"schema_registry":     "http://localhost:8081",
-	"clickhouse_dsn":      "tcp://localhost:9000",
-	"group_id":            "kahouse",
-	"batch_size":          10000,
-	"batch_delay_ms":      200,
-	"max_retries":         3,
-	"retry_backoff_ms":    100,
-	"metrics_port":        9090,
-	"dlq_topic_suffix":    ".dlq",
-	"input_format":        "avro",
-	"string_value_column": "value",
+	"kafka_brokers":            "localhost:9092",
+	"schema_registry":          "http://localhost:8081",
+	"schema_registry_username": "",
+	"schema_registry_password": "",
+	"clickhouse_dsn":           "tcp://localhost:9000",
+	"group_id":                 "kahouse",
+	"batch_size":               10000,
+	"batch_delay_ms":           200,
+	"max_retries":              3,
+	"retry_backoff_ms":         100,
+	"metrics_port":             9090,
+	"dlq_topic_suffix":         ".dlq",
+	"input_format":             "avro",
+	"string_value_column":      "value",
+	"kafka_security_protocol":  "",
+	"kafka_sasl_mechanism":     "",
+	"kafka_sasl_username":      "",
+	"kafka_sasl_password":      "",
+	"kafka_ssl_ca_location":    "",
 }
 
 func loadConfig() (*Config, error) {

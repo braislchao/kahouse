@@ -23,7 +23,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN go build -o kahouse ./cmd/kahouse
+RUN go build -tags dynamic -o kahouse ./cmd/kahouse
 
 # Use a slim runtime image with librdkafka available.
 FROM debian:bookworm-slim
