@@ -37,6 +37,10 @@ type Config struct {
 	// String input settings.
 	StringValueColumn string `mapstructure:"string_value_column"`
 
+	// Schema Registry authentication (optional — omit for unauthenticated registries)
+	SchemaRegistryUsername string `mapstructure:"schema_registry_username"`
+	SchemaRegistryPassword string `mapstructure:"schema_registry_password"`
+
 	// Kafka authentication (all optional — omit for unauthenticated clusters)
 	KafkaSecurityProtocol string `mapstructure:"kafka_security_protocol"`
 	KafkaSASLMechanism    string `mapstructure:"kafka_sasl_mechanism"`
@@ -294,6 +298,8 @@ func configLogFields(cfg *Config) []interface{} {
 	return []interface{}{
 		"kafka_brokers", cfg.KafkaBrokers,
 		"schema_registry", cfg.SchemaRegistry,
+		"schema_registry_username", cfg.SchemaRegistryUsername,
+		"schema_registry_password", redactSecret(cfg.SchemaRegistryPassword),
 		"clickhouse_dsn", redactDSN(cfg.ClickHouseDSN),
 		"group_id", cfg.GroupID,
 		"dlq_topic_suffix", cfg.DLQTopicSuffix,

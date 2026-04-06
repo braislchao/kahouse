@@ -9,6 +9,11 @@ dlq_topic_suffix: ".dlq"
 input_format: "avro"           # avro | json | string
 string_value_column: "value"   # used only when input_format is string
 
+# Schema Registry authentication (optional — omit for unauthenticated registries)
+# For Confluent Cloud, use your Schema Registry API key and secret.
+# schema_registry_username: "your-sr-api-key"
+# schema_registry_password: "your-sr-api-secret"
+
 # Kafka authentication (optional — omit all fields for unauthenticated clusters)
 # Typical values for Confluent Cloud or MSK:
 # kafka_security_protocol: "SASL_SSL"

@@ -45,8 +45,17 @@ func Run() {
 
 	var srClient schemaregistry.Client
 	if anyTopicUsesFormat(cfg, "avro") {
-		// Shared Schema Registry client
-		srClient, err = schemaregistry.NewClient(schemaregistry.NewConfig(cfg.SchemaRegistry))
+		var srCfg *schemaregistry.Config
+		if cfg.SchemaRegistryUsername != "" {
+			srCfg = schemaregistry.NewConfigWithAuthentication(
+				cfg.SchemaRegistry,
+				cfg.SchemaRegistryUsername,
+				cfg.SchemaRegistryPassword,
+			)
+		} else {
+			srCfg = schemaregistry.NewConfig(cfg.SchemaRegistry)
+		}
+		srClient, err = schemaregistry.NewClient(srCfg)
 		if err != nil {
 			sugar.Fatalf("Failed to create Schema Registry client: %v", err)
 		}
