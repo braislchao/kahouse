@@ -364,11 +364,7 @@ func (t *SinkTask) writeAndCommitBatch(ctx context.Context, batch []map[string]i
 
 	if writeErr != nil {
 		msgFailed.WithLabelValues(topic).Add(float64(len(batch)))
-		t.sugar.Errorf("Sending batch of %d records to DLQ after %d failed attempts", len(batch), attempts)
-		if err := sendBatchToDLQ(t.dlqProducer, topic, t.dlqTopicSuffix, batch, writeErr.Error(), t.sugar); err != nil {
-			return fmt.Errorf("failed to send batch to DLQ: %w", err)
-		}
-		msgDLQ.WithLabelValues(topic).Add(float64(len(batch)))
+		return fmt.Errorf("batch write failed after %d attempts: %w", attempts, writeErr)
 	} else {
 		msgProduced.WithLabelValues(topic).Add(float64(len(batch)))
 	}

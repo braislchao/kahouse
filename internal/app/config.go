@@ -99,7 +99,7 @@ var defaults = map[string]interface{}{
 	"group_id":                 "kahouse",
 	"batch_size":               10000,
 	"batch_delay_ms":           200,
-	"max_retries":              3,
+	"max_retries":              5,
 	"retry_backoff_ms":         100,
 	"metrics_port":             9090,
 	"dlq_topic_suffix":         ".dlq",

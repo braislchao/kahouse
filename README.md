@@ -34,13 +34,13 @@ graph LR
     classDef clickhouse fill:#f5c542,stroke:#c49a1a,color:#333
 ```
 
-Each sink task runs two goroutines: a **consumer loop** that reads and decodes messages, and a **batch processor** that accumulates records and flushes them to ClickHouse when a size or time threshold is reached. On write failure, retries with exponential backoff are attempted before forwarding to a Dead Letter Queue. Decode errors (bad data, schema mismatch) **stop the task** by default -- use [repair mode](#repair-mode) to route them to the DLQ instead.
+Each sink task runs two goroutines: a **consumer loop** that reads and decodes messages, and a **batch processor** that accumulates records and flushes them to ClickHouse when a size or time threshold is reached. Write failures are retried with exponential backoff; if all retries are exhausted the task stops. Decode errors (bad data, schema mismatch) also **stop the task** by default -- use [repair mode](#repair-mode) to route them to the DLQ instead.
 
 **Topic isolation**: each topic runs independently with its own consumer, decoder, and batch buffer. A failure in one topic (bad data, schema change, ClickHouse error) stops only that task -- the others keep running. Stopped topics can be restarted via the admin API without redeploying.
 
 ### Delivery semantics
 
-kahouse provides **at-least-once** delivery. Offsets are committed only after a batch is successfully written to ClickHouse (or forwarded to the DLQ). On restart, some records may be re-delivered.
+kahouse provides **at-least-once** delivery. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered.
 
 To handle duplicates, kahouse injects three metadata columns into every record:
 
@@ -86,7 +86,7 @@ dlq_topic_suffix: ".dlq"
 
 batch_size: 10000                 # max records per batch
 batch_delay_ms: 200               # max ms to wait before flushing
-max_retries: 3
+max_retries: 5
 retry_backoff_ms: 100
 
 topic_tables:
@@ -97,7 +97,7 @@ topic_tables:
     table: "default.payments"
     format: "string"
     string_value_column: "raw"
-    max_retries: 0                # fail fast to DLQ
+    max_retries: 0                # fail fast, stop on first write error
 ```
 
 ### Per-topic overrides
@@ -250,20 +250,21 @@ All metrics are labeled by `topic`.
 
 ## Dead Letter Queue
 
-Messages that fail ClickHouse batch writes (after retries) are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`). Decode errors (bad JSON, schema mismatch) are **not** sent to the DLQ by default -- they stop the task. Enable repair mode with `{"mode":"dlq"}` to route decode errors to the DLQ.
+The DLQ is used exclusively for decode errors when [repair mode](#repair-mode) is enabled with `{"mode":"dlq"}`. Bad messages are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`).
+
+Write failures do **not** go to the DLQ -- they stop the task after retries are exhausted. Since Kafka retains messages, restarting the task replays from the last committed offset.
 
 Each DLQ record is a JSON object containing:
 
 ```json
 {
   "original_topic": "orders",
-  "error": "failed to send batch insert: ...",
+  "error": "failed to decode message: ...",
   "timestamp": 1712345678000,
-  "record": { "...original record..." }
+  "key": "...",
+  "value": "...raw message..."
 }
 ```
-
-For per-message deserialization errors, the DLQ record contains `key` and `value` (raw strings) instead of `record`.
 
 ## Testing
 
