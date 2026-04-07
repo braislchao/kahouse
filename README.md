@@ -170,7 +170,7 @@ Operational endpoints for managing individual topics at runtime. No deploy or po
 |----------|-------------|
 | `GET /api/topics` | List all topics with status (`running`/`stopped`) and repair mode |
 | `POST /api/topics/{topic}/stop` | Stop a single topic |
-| `POST /api/topics/{topic}/start` | Start a stopped topic (no-op error if already running) |
+| `POST /api/topics/{topic}/start` | Start a stopped topic (returns 409 if already running) |
 | `POST /api/topics/{topic}/restart` | Stop (if running) and start a topic |
 | `POST /api/topics/{topic}/repair` | Enable repair mode: `{"mode":"dlq"}` or `{"mode":"skip"}` |
 | `DELETE /api/topics/{topic}/repair` | Disable repair mode (back to fail-on-error) |
@@ -227,7 +227,9 @@ All metrics are labeled by `topic`.
 
 ## Dead Letter Queue
 
-Failed messages are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`). Each DLQ record is a JSON object containing:
+Messages that fail ClickHouse batch writes (after retries) are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`). Decode errors (bad JSON, schema mismatch) are **not** sent to the DLQ by default -- they stop the task. Enable repair mode with `{"mode":"dlq"}` to route decode errors to the DLQ.
+
+Each DLQ record is a JSON object containing:
 
 ```json
 {
