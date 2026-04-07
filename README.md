@@ -13,6 +13,8 @@ Kafka topic B ──> consumer B ──> batch buffer B ──> ClickHouse table
 
 Each sink task runs two goroutines: a **consumer loop** that reads and decodes messages, and a **batch processor** that accumulates records and flushes them to ClickHouse when a size or time threshold is reached. On write failure, retries with exponential backoff are attempted before forwarding to a Dead Letter Queue.
 
+**Topic isolation**: each topic runs independently. A failure in one topic (bad data, schema change, ClickHouse error) stops only that topic -- the other 199 keep running. Stopped topics can be restarted via the admin API without redeploying.
+
 ### Delivery semantics
 
 kahouse provides **at-least-once** delivery. Offsets are committed only after a batch is successfully written to ClickHouse (or forwarded to the DLQ). On restart, some records may be re-delivered.
@@ -156,9 +158,55 @@ Default port is `9090` (configurable via `metrics_port`).
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /livez` | Liveness -- returns 200 if the process is running |
+| `GET /livez` | Liveness -- returns 200 if at least one task is running, 503 if all stopped |
 | `GET /readyz` | Readiness -- returns 200 if ClickHouse is reachable and all consumers have partition assignments |
 | `GET /metrics` | Prometheus metrics |
+
+### Admin API
+
+Operational endpoints for managing individual topics at runtime. No deploy or pod restart needed.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/topics` | List all topics with status (`running`/`stopped`) and repair mode |
+| `POST /api/topics/{topic}/stop` | Stop a single topic |
+| `POST /api/topics/{topic}/start` | Start a stopped topic (returns 409 if already running) |
+| `POST /api/topics/{topic}/restart` | Stop (if running) and start a topic |
+| `POST /api/topics/{topic}/repair` | Enable repair mode: `{"mode":"dlq"}` or `{"mode":"skip"}` |
+| `DELETE /api/topics/{topic}/repair` | Disable repair mode (back to fail-on-error) |
+
+Examples:
+
+```bash
+# Check which topics are running
+curl http://localhost:9090/api/topics
+
+# Restart a failed topic after fixing the root cause
+curl -X POST http://localhost:9090/api/topics/orders/start
+
+# Force-restart a running topic (stop + start)
+curl -X POST http://localhost:9090/api/topics/orders/restart
+
+# Enable DLQ repair mode to drain bad messages
+curl -X POST http://localhost:9090/api/topics/orders/repair \
+  -d '{"mode":"dlq"}'
+
+# Disable repair mode when done
+curl -X DELETE http://localhost:9090/api/topics/orders/repair
+```
+
+### Repair mode
+
+By default, a message that fails decoding (bad JSON, schema mismatch, corrupted payload) **stops the topic task**. This is intentional -- bad data in a data warehouse should be investigated, not silently discarded.
+
+When the cause is known and you need to unblock consumption, enable repair mode per topic:
+
+| Mode | Behavior |
+|------|----------|
+| `dlq` | Send bad messages to the DLQ, continue consuming good ones |
+| `skip` | Discard bad messages, continue consuming |
+
+Repair mode **resets to off** when a topic is restarted. This prevents forgotten repair modes from hiding future bad data.
 
 ### Prometheus metrics
 
@@ -170,6 +218,8 @@ All metrics are labeled by `topic`.
 | `kahouse_msg_produced_total` | Counter | Messages written to ClickHouse |
 | `kahouse_msg_failed_total` | Counter | Deserialization errors + write failures |
 | `kahouse_msg_dlq_total` | Counter | Messages forwarded to DLQ |
+| `kahouse_task_stopped` | Gauge | Whether a task has stopped (1 = stopped, 0 = running) |
+| `kahouse_task_restarts_total` | Counter | Times a task has been restarted via the admin API |
 | `kahouse_batch_size` | Histogram | Records per flushed batch |
 | `kahouse_batch_delay_seconds` | Histogram | Age of oldest record in batch at flush time |
 | `kahouse_process_latency_seconds` | Histogram | ClickHouse write duration (includes retries) |
@@ -177,7 +227,9 @@ All metrics are labeled by `topic`.
 
 ## Dead Letter Queue
 
-Failed messages are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`). Each DLQ record is a JSON object containing:
+Messages that fail ClickHouse batch writes (after retries) are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`). Decode errors (bad JSON, schema mismatch) are **not** sent to the DLQ by default -- they stop the task. Enable repair mode with `{"mode":"dlq"}` to route decode errors to the DLQ.
+
+Each DLQ record is a JSON object containing:
 
 ```json
 {

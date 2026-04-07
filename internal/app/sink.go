@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -15,17 +16,84 @@ import (
 	"go.uber.org/zap"
 )
 
+// RepairMode controls how a SinkTask handles messages that fail decoding.
+// The default (RepairModeOff) crashes the task on the first decode error.
+type RepairMode int32
+
+const (
+	// RepairModeOff is the default: decode errors stop the task immediately.
+	RepairModeOff RepairMode = 0
+	// RepairModeDLQ sends bad messages to the dead-letter queue and continues.
+	RepairModeDLQ RepairMode = 1
+	// RepairModeSkip silently discards bad messages and continues.
+	RepairModeSkip RepairMode = 2
+)
+
+// String returns the human-readable name of the repair mode.
+func (m RepairMode) String() string {
+	switch m {
+	case RepairModeDLQ:
+		return "dlq"
+	case RepairModeSkip:
+		return "skip"
+	default:
+		return ""
+	}
+}
+
+// ParseRepairMode converts a string to a RepairMode value.
+func ParseRepairMode(s string) (RepairMode, error) {
+	switch s {
+	case "dlq":
+		return RepairModeDLQ, nil
+	case "skip":
+		return RepairModeSkip, nil
+	case "", "off":
+		return RepairModeOff, nil
+	default:
+		return RepairModeOff, fmt.Errorf("invalid repair mode %q: must be dlq, skip, or off", s)
+	}
+}
+
 // SinkTask represents a single topic-to-table sink pipeline.
+// Each task has its own lifecycle: when it encounters an unrecoverable error it stops
+// itself without affecting other tasks running in the same process.
 type SinkTask struct {
 	mapping        TopicTableMapping
 	dlqTopicSuffix string
-	cancel         context.CancelFunc
 	chConn         driver.Conn
 	decoder        MessageDecoder
 	dlqProducer    *kafka.Producer
 	consumer       *kafka.Consumer
 	sugar          *zap.SugaredLogger
 	msgChan        chan map[string]interface{}
+	stopped        atomic.Bool
+	repairMode     atomic.Int32
+}
+
+// IsStopped reports whether the sink task has stopped running.
+func (t *SinkTask) IsStopped() bool {
+	return t.stopped.Load()
+}
+
+// TopicName returns the Kafka topic this task consumes.
+func (t *SinkTask) TopicName() string {
+	return t.mapping.Topic
+}
+
+// Assignment returns the current partition assignment for this task's consumer.
+func (t *SinkTask) Assignment() ([]kafka.TopicPartition, error) {
+	return t.consumer.Assignment()
+}
+
+// SetRepairMode atomically sets the repair mode for this task.
+func (t *SinkTask) SetRepairMode(mode RepairMode) {
+	t.repairMode.Store(int32(mode))
+}
+
+// GetRepairMode atomically reads the current repair mode.
+func (t *SinkTask) GetRepairMode() RepairMode {
+	return RepairMode(t.repairMode.Load())
 }
 
 // NewSinkTask creates and initializes a new SinkTask.
@@ -35,7 +103,6 @@ func NewSinkTask(
 	chConn driver.Conn,
 	srClient schemaregistry.Client,
 	dlqProducer *kafka.Producer,
-	cancel context.CancelFunc,
 	sugar *zap.SugaredLogger,
 ) (*SinkTask, error) {
 	decoder, err := newMessageDecoder(mapping.Format, mapping.StringValueColumn, srClient)
@@ -72,7 +139,6 @@ func NewSinkTask(
 	return &SinkTask{
 		mapping:        mapping,
 		dlqTopicSuffix: cfg.DLQTopicSuffix,
-		cancel:         cancel,
 		chConn:         chConn,
 		decoder:        decoder,
 		dlqProducer:    dlqProducer,
@@ -83,22 +149,28 @@ func NewSinkTask(
 }
 
 // Run starts the consumer loop and batch processor.
-func (t *SinkTask) Run(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
+// Each task gets its own cancellable context derived from the parent, so stopping
+// one task (e.g. due to an unrecoverable error) does not affect other tasks.
+func (t *SinkTask) Run(ctx context.Context) {
 	defer t.consumer.Close()
+	defer t.stopped.Store(true)
+	defer taskStopped.WithLabelValues(t.mapping.Topic).Set(1)
+
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	defer taskCancel()
 
 	var batchWg sync.WaitGroup
 	batchWg.Add(1)
-	go t.batchProcessor(ctx, &batchWg)
+	go t.batchProcessor(taskCtx, taskCancel, &batchWg)
 
-	t.consumerLoop(ctx)
+	t.consumerLoop(taskCtx, taskCancel)
 
 	close(t.msgChan)
 	batchWg.Wait()
 }
 
 // consumerLoop reads messages from Kafka and sends them to the batch processor.
-func (t *SinkTask) consumerLoop(ctx context.Context) {
+func (t *SinkTask) consumerLoop(ctx context.Context, cancel context.CancelFunc) {
 	topic := t.mapping.Topic
 	for {
 		select {
@@ -134,7 +206,7 @@ func (t *SinkTask) consumerLoop(ctx context.Context) {
 			t.sugar.Warn("Received tombstone message (nil value), committing offset and skipping")
 			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after tombstone: %v", commitErr)
-				t.cancel()
+				cancel()
 				return
 			}
 			continue
@@ -144,14 +216,28 @@ func (t *SinkTask) consumerLoop(ctx context.Context) {
 		if err != nil {
 			t.sugar.Errorf("Failed to decode message: %v", err)
 			msgFailed.WithLabelValues(topic).Inc()
-			if dlqErr := sendToDLQ(t.dlqProducer, topic, t.dlqTopicSuffix, msg.Key, msg.Value, err.Error(), t.sugar); dlqErr != nil {
-				t.sugar.Errorf("Failed to send message to DLQ: %v", dlqErr)
-				t.cancel()
+
+			mode := t.GetRepairMode()
+			switch mode {
+			case RepairModeOff:
+				t.sugar.Errorf("Decode error in strict mode, stopping task for topic %s", topic)
+				cancel()
 				return
+			case RepairModeDLQ:
+				if dlqErr := sendToDLQ(t.dlqProducer, topic, t.dlqTopicSuffix, msg.Key, msg.Value, err.Error(), t.sugar); dlqErr != nil {
+					t.sugar.Errorf("Failed to send message to DLQ: %v", dlqErr)
+					cancel()
+					return
+				}
+				msgDLQ.WithLabelValues(topic).Inc()
+			case RepairModeSkip:
+				t.sugar.Warnf("Skipping bad message in repair mode (partition=%d offset=%d)",
+					msg.TopicPartition.Partition, msg.TopicPartition.Offset)
 			}
+
 			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
-				t.sugar.Errorf("Failed to commit offset after deserialization error: %v", commitErr)
-				t.cancel()
+				t.sugar.Errorf("Failed to commit offset after decode error: %v", commitErr)
+				cancel()
 				return
 			}
 			continue
@@ -172,7 +258,7 @@ func (t *SinkTask) consumerLoop(ctx context.Context) {
 }
 
 // batchProcessor accumulates messages and flushes them to ClickHouse.
-func (t *SinkTask) batchProcessor(ctx context.Context, wg *sync.WaitGroup) {
+func (t *SinkTask) batchProcessor(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	var batch []map[string]interface{}
@@ -210,7 +296,7 @@ func (t *SinkTask) batchProcessor(ctx context.Context, wg *sync.WaitGroup) {
 				"flush_duration_ms", time.Since(flushStart).Milliseconds(),
 				"queue_depth_after", len(t.msgChan),
 			)
-			t.cancel()
+			cancel()
 			return false
 		}
 		t.sugar.Infow(

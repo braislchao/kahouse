@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,14 +36,16 @@ func validConfig() Config {
 	}
 }
 
-type stubAssignmentChecker struct {
+type stubSinkChecker struct {
+	stopped    bool
+	topic      string
 	assignment []kafka.TopicPartition
 	err        error
 }
 
-func (s stubAssignmentChecker) Assignment() ([]kafka.TopicPartition, error) {
-	return s.assignment, s.err
-}
+func (s stubSinkChecker) IsStopped() bool                             { return s.stopped }
+func (s stubSinkChecker) TopicName() string                           { return s.topic }
+func (s stubSinkChecker) Assignment() ([]kafka.TopicPartition, error) { return s.assignment, s.err }
 
 func TestExtractOffsets(t *testing.T) {
 	t.Run("empty batch", func(t *testing.T) {
@@ -760,44 +765,52 @@ func TestJSONDecoderRoundTripsValidJSONObject(t *testing.T) {
 
 func TestHealthReadinessError(t *testing.T) {
 	tests := []struct {
-		name      string
-		pingErr   error
-		consumers []consumerAssignmentChecker
-		want      string
+		name    string
+		pingErr error
+		tasks   []sinkHealthChecker
+		want    string
 	}{
 		{
 			name:    "clickhouse ping failure",
 			pingErr: errors.New("dial tcp refused"),
-			consumers: []consumerAssignmentChecker{
-				stubAssignmentChecker{assignment: []kafka.TopicPartition{{Partition: 0}}},
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", assignment: []kafka.TopicPartition{{Partition: 0}}},
 			},
 			want: "clickhouse health check failed",
 		},
 		{
-			name:      "no consumers configured",
-			consumers: nil,
-			want:      "no Kafka consumers configured",
+			name:  "no tasks configured",
+			tasks: nil,
+			want:  "no sink tasks configured",
 		},
 		{
-			name: "one consumer unassigned",
-			consumers: []consumerAssignmentChecker{
-				stubAssignmentChecker{assignment: []kafka.TopicPartition{{Partition: 0}}},
-				stubAssignmentChecker{},
+			name: "one task stopped",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", assignment: []kafka.TopicPartition{{Partition: 0}}},
+				stubSinkChecker{topic: "payments", stopped: true},
 			},
-			want: "consumer 1 has no partition assignment",
+			want: `sink task for topic "payments" has stopped`,
+		},
+		{
+			name: "one task unassigned",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", assignment: []kafka.TopicPartition{{Partition: 0}}},
+				stubSinkChecker{topic: "payments"},
+			},
+			want: `sink task for topic "payments" has no partition assignment`,
 		},
 		{
 			name: "assignment check error",
-			consumers: []consumerAssignmentChecker{
-				stubAssignmentChecker{err: errors.New("broker unavailable")},
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", err: errors.New("broker unavailable")},
 			},
-			want: "consumer 0 assignment check failed",
+			want: `sink task for topic "orders" assignment check failed`,
 		},
 		{
-			name: "all consumers assigned",
-			consumers: []consumerAssignmentChecker{
-				stubAssignmentChecker{assignment: []kafka.TopicPartition{{Partition: 0}}},
-				stubAssignmentChecker{assignment: []kafka.TopicPartition{{Partition: 1}}},
+			name: "all tasks healthy",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", assignment: []kafka.TopicPartition{{Partition: 0}}},
+				stubSinkChecker{topic: "payments", assignment: []kafka.TopicPartition{{Partition: 1}}},
 			},
 			want: "",
 		},
@@ -810,7 +823,7 @@ func TestHealthReadinessError(t *testing.T) {
 				ping: func(context.Context) error {
 					return tt.pingErr
 				},
-				consumers: tt.consumers,
+				tasks: func() []sinkHealthChecker { return tt.tasks },
 			}
 
 			err := health.readinessError(context.Background())
@@ -827,5 +840,400 @@ func TestHealthReadinessError(t *testing.T) {
 				t.Fatalf("Expected error containing %q, got %q", tt.want, err.Error())
 			}
 		})
+	}
+}
+
+func TestHealthLivenessAllStopped(t *testing.T) {
+	tests := []struct {
+		name  string
+		tasks []sinkHealthChecker
+		want  int
+	}{
+		{
+			name:  "no tasks returns 503",
+			tasks: nil,
+			want:  http.StatusServiceUnavailable,
+		},
+		{
+			name: "all stopped returns 503",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", stopped: true},
+				stubSinkChecker{topic: "payments", stopped: true},
+			},
+			want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "some running returns 200",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", stopped: true},
+				stubSinkChecker{topic: "payments"},
+			},
+			want: http.StatusOK,
+		},
+		{
+			name: "all running returns 200",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders"},
+				stubSinkChecker{topic: "payments"},
+			},
+			want: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			health := &Health{
+				logger: zap.NewNop().Sugar(),
+				ping:   func(context.Context) error { return nil },
+				tasks:  func() []sinkHealthChecker { return tt.tasks },
+			}
+			rr := httptest.NewRecorder()
+			health.Livez(rr, httptest.NewRequest("GET", "/livez", nil))
+			if rr.Code != tt.want {
+				t.Fatalf("Expected status %d, got %d (body: %s)", tt.want, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestParseRepairMode(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    RepairMode
+		wantErr bool
+	}{
+		{input: "", want: RepairModeOff},
+		{input: "off", want: RepairModeOff},
+		{input: "dlq", want: RepairModeDLQ},
+		{input: "skip", want: RepairModeSkip},
+		{input: "invalid", wantErr: true},
+		{input: "DLQ", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("input=%q", tt.input), func(t *testing.T) {
+			got, err := ParseRepairMode(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("Expected error for input %q", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error for input %q: %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Fatalf("Expected %v for input %q, got %v", tt.want, tt.input, got)
+			}
+		})
+	}
+}
+
+func TestRepairModeString(t *testing.T) {
+	if s := RepairModeOff.String(); s != "" {
+		t.Fatalf("Expected empty string for RepairModeOff, got %q", s)
+	}
+	if s := RepairModeDLQ.String(); s != "dlq" {
+		t.Fatalf("Expected dlq for RepairModeDLQ, got %q", s)
+	}
+	if s := RepairModeSkip.String(); s != "skip" {
+		t.Fatalf("Expected skip for RepairModeSkip, got %q", s)
+	}
+}
+
+func TestRepairModeRoundTrip(t *testing.T) {
+	for _, mode := range []RepairMode{RepairModeOff, RepairModeDLQ, RepairModeSkip} {
+		s := mode.String()
+		if s == "" {
+			s = "off"
+		}
+		parsed, err := ParseRepairMode(s)
+		if err != nil {
+			t.Fatalf("Failed to round-trip repair mode %v: %v", mode, err)
+		}
+		if parsed != mode {
+			t.Fatalf("Round-trip mismatch: %v -> %q -> %v", mode, s, parsed)
+		}
+	}
+}
+
+func TestTaskManagerTopics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	// Manually register two managed tasks with stubs.
+	stoppedTask := &SinkTask{mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"}}
+	stoppedTask.stopped.Store(true)
+
+	runningTask := &SinkTask{mapping: TopicTableMapping{Topic: "payments", Table: "default.payments"}}
+
+	mgr.tasks["orders"] = &managedTask{
+		task:    stoppedTask,
+		mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"},
+		done:    make(chan struct{}),
+	}
+	mgr.tasks["payments"] = &managedTask{
+		task:    runningTask,
+		mapping: TopicTableMapping{Topic: "payments", Table: "default.payments"},
+		done:    make(chan struct{}),
+	}
+
+	topics := mgr.Topics()
+	if len(topics) != 2 {
+		t.Fatalf("Expected 2 topics, got %d", len(topics))
+	}
+
+	statusByTopic := make(map[string]TopicStatus)
+	for _, ts := range topics {
+		statusByTopic[ts.Topic] = ts
+	}
+
+	if statusByTopic["orders"].Status != "stopped" {
+		t.Fatalf("Expected orders to be stopped, got %q", statusByTopic["orders"].Status)
+	}
+	if statusByTopic["payments"].Status != "running" {
+		t.Fatalf("Expected payments to be running, got %q", statusByTopic["payments"].Status)
+	}
+}
+
+func TestTaskManagerSnapshot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task1 := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	task2 := &SinkTask{mapping: TopicTableMapping{Topic: "payments"}}
+
+	mgr.tasks["orders"] = &managedTask{task: task1, mapping: TopicTableMapping{Topic: "orders"}}
+	mgr.tasks["payments"] = &managedTask{task: task2, mapping: TopicTableMapping{Topic: "payments"}}
+
+	snap := mgr.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("Expected 2 health checkers in snapshot, got %d", len(snap))
+	}
+}
+
+func TestTaskManagerSetRepairMode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	mgr.tasks["orders"] = &managedTask{task: task, mapping: TopicTableMapping{Topic: "orders"}}
+
+	// Set DLQ mode
+	if err := mgr.SetRepairMode("orders", RepairModeDLQ); err != nil {
+		t.Fatalf("Failed to set repair mode: %v", err)
+	}
+	if task.GetRepairMode() != RepairModeDLQ {
+		t.Fatalf("Expected DLQ repair mode, got %v", task.GetRepairMode())
+	}
+
+	// Clear mode
+	if err := mgr.ClearRepairMode("orders"); err != nil {
+		t.Fatalf("Failed to clear repair mode: %v", err)
+	}
+	if task.GetRepairMode() != RepairModeOff {
+		t.Fatalf("Expected Off repair mode after clear, got %v", task.GetRepairMode())
+	}
+
+	// Non-existent topic
+	if err := mgr.SetRepairMode("missing", RepairModeDLQ); err == nil {
+		t.Fatal("Expected error for non-existent topic")
+	}
+}
+
+func TestAdminHandlerListTopics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"}}
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"},
+	}
+
+	mux := http.NewServeMux()
+	RegisterAdminEndpoints(mgr, mux)
+
+	rr := httptest.NewRecorder()
+	rr2 := httptest.NewRequest("GET", "/api/topics", nil)
+	mux.ServeHTTP(rr, rr2)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", rr.Code)
+	}
+
+	var topics []TopicStatus
+	if err := json.NewDecoder(rr.Body).Decode(&topics); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if len(topics) != 1 || topics[0].Topic != "orders" {
+		t.Fatalf("Unexpected topics response: %+v", topics)
+	}
+}
+
+func TestAdminHandlerSetRepair(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders"},
+	}
+
+	mux := http.NewServeMux()
+	RegisterAdminEndpoints(mgr, mux)
+
+	// Set DLQ mode
+	body := strings.NewReader(`{"mode":"dlq"}`)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/topics/orders/repair", body)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	if task.GetRepairMode() != RepairModeDLQ {
+		t.Fatalf("Expected DLQ mode after API call, got %v", task.GetRepairMode())
+	}
+
+	// Clear repair mode
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest("DELETE", "/api/topics/orders/repair", nil)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected 200, got %d", rr.Code)
+	}
+	if task.GetRepairMode() != RepairModeOff {
+		t.Fatalf("Expected Off mode after DELETE, got %v", task.GetRepairMode())
+	}
+
+	// Invalid mode
+	body = strings.NewReader(`{"mode":"invalid"}`)
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/api/topics/orders/repair", body)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("Expected 400 for invalid mode, got %d", rr.Code)
+	}
+
+	// Non-existent topic
+	body = strings.NewReader(`{"mode":"dlq"}`)
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/api/topics/missing/repair", body)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("Expected 404 for missing topic, got %d", rr.Code)
+	}
+}
+
+func TestAdminHandlerStopNonExistentTopic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	mux := http.NewServeMux()
+	RegisterAdminEndpoints(mgr, mux)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/topics/missing/stop", nil)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("Expected 404 for missing topic, got %d", rr.Code)
+	}
+}
+
+func TestAdminHandlerStartAlreadyRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	// task is not stopped — IsStopped() returns false by default
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders"},
+		done:    make(chan struct{}),
+	}
+
+	mux := http.NewServeMux()
+	RegisterAdminEndpoints(mgr, mux)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/topics/orders/start", nil)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("Expected 409 for already-running topic, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestTaskManagerStartRejectsRunningTopic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders"},
+		done:    make(chan struct{}),
+	}
+
+	err := mgr.Start("orders")
+	if err == nil {
+		t.Fatal("Expected error when starting an already-running topic")
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("Expected 'already running' error, got %q", err.Error())
 	}
 }
