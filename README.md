@@ -1,6 +1,6 @@
 # kahouse
 
-A lightweight Go service that sinks Kafka topics into ClickHouse tables. Each topic gets its own consumer and independent batch pipeline.
+A lightweight Go service that sinks Kafka topics into ClickHouse tables.
 
 ```mermaid
 graph LR
@@ -34,21 +34,14 @@ graph LR
     classDef clickhouse fill:#f5c542,stroke:#c49a1a,color:#333
 ```
 
-Each sink task runs a single loop: read a message, decode it, add it to the batch buffer, and flush to ClickHouse when a size or time threshold is reached. Write failures are retried with exponential backoff; if all retries are exhausted the task stops. Decode errors (bad data, schema mismatch) also **stop the task** by default -- use [repair mode](#repair-mode) to route them to the DLQ instead.
+Each topic gets its own sink task with an independent consumer, decoder, and batch buffer. A sink task runs a single loop: read a message, decode it, buffer it, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task -- the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying.
 
-**Topic isolation**: each topic runs independently with its own consumer, decoder, and batch buffer. A failure in one topic (bad data, schema change, ClickHouse error) stops only that task -- the others keep running. Stopped topics can be restarted via the admin API without redeploying.
-
-### Delivery semantics
-
-kahouse provides **at-least-once** delivery. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered. Deduplication is the responsibility of the downstream table design (e.g. `ReplacingMergeTree` with an application-level key).
+Delivery is **at-least-once**. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered. Deduplication is your responsibility (e.g. `ReplacingMergeTree` with an application-level key).
 
 ## Quick start
 
 ```bash
-# Build
 go build -o kahouse ./cmd/kahouse
-
-# Run with a config file
 ./kahouse -config kahouse.yaml
 ```
 
@@ -56,7 +49,7 @@ Or with Docker:
 
 ```bash
 docker build -t kahouse .
-docker run -v $(pwd)/kahouse.yaml:/etc/kahouse/kahouse.yaml kahouse
+docker run -v $(pwd)/kahouse.yaml:/kahouse.yaml kahouse
 ```
 
 ## Configuration
@@ -87,9 +80,7 @@ topic_tables:
     max_retries: 0                # fail fast, stop on first write error
 ```
 
-### Per-topic overrides
-
-Each topic can override `format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, and `retry_backoff_ms`. Omit a field to inherit the global default. Setting a field to `0` is valid and takes effect (it is not treated as "not set").
+See `config.yaml.example` for a full annotated example.
 
 ### Input formats
 
@@ -99,7 +90,32 @@ Each topic can override `format`, `string_value_column`, `batch_size`, `batch_de
 | `json` | Single JSON object per message. Integers decode as `Int64`, decimals as `Float64`. | No |
 | `string` | Raw message value stored in a single column (configured via `string_value_column`). | No |
 
-## ClickHouse table requirements
+### Per-topic overrides
+
+Each topic can override `format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, and `retry_backoff_ms`. Omit a field to inherit the global default. Setting a field to `0` is valid and takes effect (it is not treated as "not set").
+
+### Kafka authentication
+
+SASL and TLS are supported. All auth fields are optional -- omit them for unauthenticated clusters.
+
+```yaml
+kafka_security_protocol: "SASL_SSL"
+kafka_sasl_mechanism: "PLAIN"
+kafka_sasl_username: "your-api-key"
+kafka_sasl_password: "your-api-secret"
+kafka_ssl_ca_location: "/path/to/ca.crt"     # only for custom CAs
+```
+
+Schema Registry authentication:
+
+```yaml
+schema_registry_username: "your-sr-api-key"
+schema_registry_password: "your-sr-api-secret"
+```
+
+Each topic gets its own consumer group in the format `kahouse-<group_id>-<topic>`, ensuring full offset isolation between topics.
+
+## ClickHouse
 
 Table columns must match the fields in the decoded messages. kahouse does not inject any metadata columns -- your table schema is entirely up to you.
 
@@ -116,109 +132,28 @@ For `Nullable` Avro fields, use `Nullable(T)` column types. For sparse JSON (whe
 
 Async inserts are enabled by default (`async_insert=1, wait_for_async_insert=1`).
 
-## Kafka authentication
+## Error handling
 
-kahouse supports SASL and TLS authentication. All auth fields are optional -- omit them for unauthenticated clusters.
+Write failures are retried with exponential backoff. If all retries are exhausted, the task stops. Since Kafka retains messages, restarting the task replays from the last committed offset.
 
-```yaml
-kafka_security_protocol: "SASL_SSL"
-kafka_sasl_mechanism: "PLAIN"
-kafka_sasl_username: "your-api-key"
-kafka_sasl_password: "your-api-secret"
-kafka_ssl_ca_location: "/path/to/ca.crt"     # only for custom CAs
-```
-
-Schema Registry authentication is also supported:
-
-```yaml
-schema_registry_username: "your-sr-api-key"
-schema_registry_password: "your-sr-api-secret"
-```
-
-### Consumer group ID
-
-Each topic gets its own consumer group in the format `kahouse-<group_id>-<topic>`. This ensures full offset isolation between topics.
-
-## Health and metrics
-
-Default port is `9090` (configurable via `metrics_port`).
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /livez` | Liveness -- returns 200 if at least one task is running, 503 if all stopped |
-| `GET /readyz` | Readiness -- returns 200 if ClickHouse is reachable and all consumers have partition assignments |
-| `GET /metrics` | Prometheus metrics |
-
-### Admin API
-
-Operational endpoints for managing individual topics at runtime. No deploy or pod restart needed.
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/topics` | List all topics with status (`running`/`stopped`) and repair mode |
-| `POST /api/topics/{topic}/stop` | Stop a single topic |
-| `POST /api/topics/{topic}/start` | Start a stopped topic (returns 409 if already running) |
-| `POST /api/topics/{topic}/restart` | Stop (if running) and start a topic |
-| `POST /api/topics/{topic}/repair` | Enable repair mode: `{"mode":"dlq"}` or `{"mode":"skip"}` |
-| `DELETE /api/topics/{topic}/repair` | Disable repair mode (back to fail-on-error) |
-
-Examples:
-
-```bash
-# Check which topics are running
-curl http://localhost:9090/api/topics
-
-# Restart a failed topic after fixing the root cause
-curl -X POST http://localhost:9090/api/topics/orders/start
-
-# Force-restart a running topic (stop + start)
-curl -X POST http://localhost:9090/api/topics/orders/restart
-
-# Enable DLQ repair mode to drain bad messages
-curl -X POST http://localhost:9090/api/topics/orders/repair \
-  -d '{"mode":"dlq"}'
-
-# Disable repair mode when done
-curl -X DELETE http://localhost:9090/api/topics/orders/repair
-```
+Decode errors (bad JSON, schema mismatch, corrupted payload) also **stop the task** by default. This is intentional -- bad data in a data warehouse should be investigated, not silently discarded. When the cause is known and you need to unblock consumption, use repair mode.
 
 ### Repair mode
 
-By default, a message that fails decoding (bad JSON, schema mismatch, corrupted payload) **stops the topic task**. This is intentional -- bad data in a data warehouse should be investigated, not silently discarded.
-
-When the cause is known and you need to unblock consumption, enable repair mode per topic:
+Enable repair mode per topic via the [admin API](#admin-api):
 
 | Mode | Behavior |
 |------|----------|
 | `dlq` | Send bad messages to the DLQ, continue consuming good ones |
 | `skip` | Discard bad messages, continue consuming |
 
-Repair mode **resets to off** when a topic is restarted. This prevents forgotten repair modes from hiding future bad data.
+Repair mode resets to off when a topic is restarted, preventing forgotten repair modes from hiding future bad data.
 
-### Prometheus metrics
+### Dead letter queue
 
-All metrics are labeled by `topic`.
+When repair mode is set to `dlq`, bad messages are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`). Write failures never go to the DLQ -- they always stop the task.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `kahouse_msg_consumed_total` | Counter | Messages read from Kafka |
-| `kahouse_msg_produced_total` | Counter | Messages written to ClickHouse |
-| `kahouse_msg_failed_total` | Counter | Deserialization errors + write failures |
-| `kahouse_msg_dlq_total` | Counter | Messages forwarded to DLQ |
-| `kahouse_task_stopped` | Gauge | Whether a task has stopped (1 = stopped, 0 = running) |
-| `kahouse_task_restarts_total` | Counter | Times a task has been restarted via the admin API |
-| `kahouse_batch_size` | Histogram | Records per flushed batch |
-| `kahouse_batch_delay_seconds` | Histogram | Age of oldest record in batch at flush time |
-| `kahouse_process_latency_seconds` | Histogram | ClickHouse write duration (includes retries) |
-| `kahouse_write_retry_count` | Histogram | Retry attempts per batch write |
-
-## Dead Letter Queue
-
-The DLQ is used exclusively for decode errors when [repair mode](#repair-mode) is enabled with `{"mode":"dlq"}`. Bad messages are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`).
-
-Write failures do **not** go to the DLQ -- they stop the task after retries are exhausted. Since Kafka retains messages, restarting the task replays from the last committed offset.
-
-Each DLQ record is a JSON object containing:
+Each DLQ record is a JSON object:
 
 ```json
 {
@@ -230,46 +165,70 @@ Each DLQ record is a JSON object containing:
 }
 ```
 
+## Observability
+
+Default port is `9090` (configurable via `metrics_port`).
+
+### Health endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /livez` | Returns 200 if at least one task is running, 503 if all stopped |
+| `GET /readyz` | Returns 200 if ClickHouse is reachable and all consumers have partition assignments |
+| `GET /metrics` | Prometheus metrics |
+
+### Admin API
+
+Operational endpoints for managing individual topics at runtime.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/topics` | List all topics with status and repair mode |
+| `POST /api/topics/{topic}/stop` | Stop a single topic |
+| `POST /api/topics/{topic}/start` | Start a stopped topic (409 if already running) |
+| `POST /api/topics/{topic}/restart` | Stop and start a topic |
+| `POST /api/topics/{topic}/repair` | Enable repair mode: `{"mode":"dlq"}` or `{"mode":"skip"}` |
+| `DELETE /api/topics/{topic}/repair` | Disable repair mode |
+
+```bash
+# Check which topics are running
+curl http://localhost:9090/api/topics
+
+# Start a stopped topic
+curl -X POST http://localhost:9090/api/topics/orders/start
+
+# Enable DLQ repair mode
+curl -X POST http://localhost:9090/api/topics/orders/repair -d '{"mode":"dlq"}'
+
+# Disable repair mode
+curl -X DELETE http://localhost:9090/api/topics/orders/repair
+```
+
+### Prometheus metrics
+
+All metrics are labeled by `topic`.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `kahouse_msg_consumed_total` | Counter | Messages read from Kafka |
+| `kahouse_msg_produced_total` | Counter | Messages written to ClickHouse |
+| `kahouse_msg_failed_total` | Counter | Deserialization errors + write failures |
+| `kahouse_msg_dlq_total` | Counter | Messages forwarded to DLQ |
+| `kahouse_task_stopped` | Gauge | 1 = stopped, 0 = running |
+| `kahouse_task_restarts_total` | Counter | Admin API restarts |
+| `kahouse_batch_size` | Histogram | Records per flushed batch |
+| `kahouse_batch_delay_seconds` | Histogram | Age of oldest record in batch at flush time |
+| `kahouse_process_latency_seconds` | Histogram | ClickHouse write duration (includes retries) |
+| `kahouse_write_retry_count` | Histogram | Retry attempts per batch write |
+
 ## Testing
 
-### Unit tests
-
 ```bash
+# Unit tests
 go test ./...
-```
 
-### Integration tests
-
-Starts all dependencies via Docker Compose, verifies a multi-format sink end-to-end, and exercises DLQ paths:
-
-```bash
+# Integration tests (starts all deps via Docker Compose)
 ./scripts/test-integration.sh
-```
-
-### Manual with Docker Compose
-
-```bash
-# Start infrastructure
-docker-compose up -d zookeeper kafka schema-registry clickhouse
-
-# Create topics, schemas, and ClickHouse tables
-docker-compose up create-resources clickhouse-init
-
-# Start the sink
-docker-compose up -d kahouse
-
-# Check health and metrics
-curl http://localhost:9090/readyz
-curl http://localhost:9090/metrics
-
-# Inspect DLQ
-docker-compose exec kafka kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
-  --topic orders.dlq \
-  --from-beginning
-
-# Cleanup
-docker-compose down -v
 ```
 
 ## License
