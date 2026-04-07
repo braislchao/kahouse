@@ -54,7 +54,7 @@ docker run -v $(pwd)/kahouse.yaml:/kahouse.yaml kahouse
 
 ## Configuration
 
-Create a YAML config file and pass it with `-config <path>` or the `KAHOUSE_CONFIG` environment variable. Defaults to `kahouse.yaml` in the working directory.
+Create a YAML config file and pass it with `-config <path>` or the `KAHOUSE_CONFIG` environment variable. Defaults to `kahouse.yaml` in the working directory. See [CONFIGURATION.md](CONFIGURATION.md) for a full reference of all options.
 
 ```yaml
 kafka_brokers: "localhost:9092"

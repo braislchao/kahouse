@@ -28,7 +28,7 @@ metrics_port: 9090
 # Global defaults (can be overridden per topic)
 batch_size: 10000
 batch_delay_ms: 200
-max_retries: 3
+max_retries: 5
 retry_backoff_ms: 100
 
 # For avro input, schema_registry must point at a Confluent-compatible Schema Registry.
