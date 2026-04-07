@@ -4,8 +4,30 @@ A lightweight Go service that sinks Kafka topics into ClickHouse tables. Each to
 
 ```mermaid
 graph LR
-    T1[Orders Topic]:::kafka --> C1[Consumer]:::pipeline --> D1[Decoder]:::pipeline --> B1[Batch Buffer]:::pipeline --> CH1[(orders)]:::clickhouse
-    T2[Payments Topic]:::kafka --> C2[Consumer]:::pipeline --> D2[Decoder]:::pipeline --> B2[Batch Buffer]:::pipeline --> CH2[(payments)]:::clickhouse
+    subgraph Kafka
+        T1[Orders Topic]:::kafka
+        T2[Payments Topic]:::kafka
+    end
+
+    subgraph kahouse
+        direction LR
+        subgraph "Sink Task A"
+            C1[Consumer]:::pipeline --> D1[Decoder]:::pipeline --> B1[Batch Buffer]:::pipeline
+        end
+        subgraph "Sink Task B"
+            C2[Consumer]:::pipeline --> D2[Decoder]:::pipeline --> B2[Batch Buffer]:::pipeline
+        end
+    end
+
+    subgraph ClickHouse
+        CH1[(orders)]:::clickhouse
+        CH2[(payments)]:::clickhouse
+    end
+
+    T1 --> C1
+    T2 --> C2
+    B1 --> CH1
+    B2 --> CH2
 
     classDef kafka fill:#ff6b35,stroke:#c44d1a,color:#fff
     classDef pipeline fill:#4a90d9,stroke:#2c6fad,color:#fff
