@@ -13,7 +13,7 @@ These fields have defaults for local development, but you will always set them e
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `kafka_brokers` | string | `localhost:9092` | Kafka bootstrap servers (comma-separated). |
-| `clickhouse_dsn` | string | `tcp://localhost:9000` | ClickHouse connection string. |
+| `clickhouse_dsn` | string | `tcp://localhost:9000` | ClickHouse connection string. Authentication and database are part of the DSN (e.g. `tcp://user:password@host:9000/mydb`). |
 | `group_id` | string | `kahouse` | Base consumer group ID. Each topic gets its own group: `kahouse-<group_id>-<topic>`. |
 | `topic_tables` | list | *(none)* | At least one topic-to-table mapping is required. See [topic_tables](#topic_tables). |
 
