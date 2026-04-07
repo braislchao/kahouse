@@ -134,7 +134,7 @@ Async inserts are enabled by default (`async_insert=1, wait_for_async_insert=1`)
 
 Write failures are retried with exponential backoff. If all retries are exhausted, the task stops. Since Kafka retains messages, restarting the task replays from the last committed offset.
 
-Decode errors (bad JSON, schema mismatch, corrupted payload) also **stop the task** by default. This is intentional -- bad data should be investigated. When the cause is known and you need to unblock consumption, use repair mode.
+Decode errors (bad JSON, schema mismatch, corrupted payload) also **stop the task** by default. This is intentional, bad data should be investigated. When the cause is known and you need to unblock consumption, use repair mode.
 
 ### Repair mode
 
