@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/confluentinc/confluent-kafka-go/schemaregistry"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
 )
 
 type MessageDecoder interface {

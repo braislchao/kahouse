@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/confluentinc/confluent-kafka-go/schemaregistry"
+	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
 	"github.com/linkedin/goavro/v2"
 )
 
