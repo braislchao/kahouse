@@ -1181,3 +1181,59 @@ func TestAdminHandlerStopNonExistentTopic(t *testing.T) {
 		t.Fatalf("Expected 404 for missing topic, got %d", rr.Code)
 	}
 }
+
+func TestAdminHandlerStartAlreadyRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	// task is not stopped — IsStopped() returns false by default
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders"},
+		done:    make(chan struct{}),
+	}
+
+	mux := http.NewServeMux()
+	RegisterAdminEndpoints(mgr, mux)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/topics/orders/start", nil)
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("Expected 409 for already-running topic, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestTaskManagerStartRejectsRunningTopic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders"},
+		done:    make(chan struct{}),
+	}
+
+	err := mgr.Start("orders")
+	if err == nil {
+		t.Fatal("Expected error when starting an already-running topic")
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("Expected 'already running' error, got %q", err.Error())
+	}
+}

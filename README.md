@@ -170,7 +170,8 @@ Operational endpoints for managing individual topics at runtime. No deploy or po
 |----------|-------------|
 | `GET /api/topics` | List all topics with status (`running`/`stopped`) and repair mode |
 | `POST /api/topics/{topic}/stop` | Stop a single topic |
-| `POST /api/topics/{topic}/restart` | Restart a stopped topic (creates a fresh consumer) |
+| `POST /api/topics/{topic}/start` | Start a stopped topic (no-op error if already running) |
+| `POST /api/topics/{topic}/restart` | Stop (if running) and start a topic |
 | `POST /api/topics/{topic}/repair` | Enable repair mode: `{"mode":"dlq"}` or `{"mode":"skip"}` |
 | `DELETE /api/topics/{topic}/repair` | Disable repair mode (back to fail-on-error) |
 
@@ -181,6 +182,9 @@ Examples:
 curl http://localhost:9090/api/topics
 
 # Restart a failed topic after fixing the root cause
+curl -X POST http://localhost:9090/api/topics/orders/start
+
+# Force-restart a running topic (stop + start)
 curl -X POST http://localhost:9090/api/topics/orders/restart
 
 # Enable DLQ repair mode to drain bad messages

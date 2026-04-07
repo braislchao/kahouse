@@ -123,6 +123,27 @@ func (m *TaskManager) Stop(topic string) error {
 	return nil
 }
 
+// Start launches a stopped topic. Returns an error if the topic is already running.
+func (m *TaskManager) Start(topic string) error {
+	if m.parentCtx.Err() != nil {
+		return fmt.Errorf("cannot start topic %q: process is shutting down", topic)
+	}
+
+	m.mu.RLock()
+	mt, exists := m.tasks[topic]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("topic %q not found", topic)
+	}
+	if !mt.task.IsStopped() {
+		return fmt.Errorf("topic %q is already running", topic)
+	}
+
+	<-mt.done // ensure previous Run has fully returned
+	return m.startTask(mt.mapping)
+}
+
 // Restart stops a topic (if running), creates a brand-new SinkTask, and launches it.
 // Repair mode is reset to off on restart.
 func (m *TaskManager) Restart(topic string) error {
@@ -235,6 +256,21 @@ func (m *TaskManager) handleStopTopic(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "topic %q stopped", topic)
 }
 
+func (m *TaskManager) handleStartTopic(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	if err := m.Start(topic); err != nil {
+		m.logger.Errorf("Failed to start topic %s: %v", topic, err)
+		status := http.StatusInternalServerError
+		if mt, exists := m.tasks[topic]; exists && !mt.task.IsStopped() {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "topic %q started", topic)
+}
+
 func (m *TaskManager) handleRestartTopic(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	if err := m.Restart(topic); err != nil {
@@ -290,6 +326,7 @@ func (m *TaskManager) handleClearRepair(w http.ResponseWriter, r *http.Request) 
 func RegisterAdminEndpoints(mgr *TaskManager, mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/topics", mgr.handleListTopics)
 	mux.HandleFunc("POST /api/topics/{topic}/stop", mgr.handleStopTopic)
+	mux.HandleFunc("POST /api/topics/{topic}/start", mgr.handleStartTopic)
 	mux.HandleFunc("POST /api/topics/{topic}/restart", mgr.handleRestartTopic)
 	mux.HandleFunc("POST /api/topics/{topic}/repair", mgr.handleSetRepair)
 	mux.HandleFunc("DELETE /api/topics/{topic}/repair", mgr.handleClearRepair)
