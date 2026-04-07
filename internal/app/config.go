@@ -51,10 +51,10 @@ type Config struct {
 	MetricsPort int `yaml:"metrics_port"`
 
 	// Batch defaults (overridable per topic)
-	BatchSize      int `yaml:"batch_size"`
-	BatchDelayMs   int `yaml:"batch_delay_ms"`
-	MaxRetries     int `yaml:"max_retries"`
-	RetryBackoffMs int `yaml:"retry_backoff_ms"`
+	BatchSize      int  `yaml:"batch_size"`
+	BatchDelayMs   *int `yaml:"batch_delay_ms"`
+	MaxRetries     *int `yaml:"max_retries"`
+	RetryBackoffMs *int `yaml:"retry_backoff_ms"`
 
 	TopicTables []TopicTableMapping `yaml:"topic_tables"`
 }
@@ -77,13 +77,13 @@ func (m *TopicTableMapping) resolve(cfg *Config) {
 		m.BatchSize = intPtr(cfg.BatchSize)
 	}
 	if m.BatchDelayMs == nil {
-		m.BatchDelayMs = intPtr(cfg.BatchDelayMs)
+		m.BatchDelayMs = cfg.BatchDelayMs
 	}
 	if m.MaxRetries == nil {
-		m.MaxRetries = intPtr(cfg.MaxRetries)
+		m.MaxRetries = cfg.MaxRetries
 	}
 	if m.RetryBackoffMs == nil {
-		m.RetryBackoffMs = intPtr(cfg.RetryBackoffMs)
+		m.RetryBackoffMs = cfg.RetryBackoffMs
 	}
 }
 
@@ -112,28 +112,25 @@ func applyDefaults(cfg *Config) {
 	if cfg.BatchSize == 0 {
 		cfg.BatchSize = 10000
 	}
-	if cfg.BatchDelayMs == 0 {
-		cfg.BatchDelayMs = 200
+	if cfg.BatchDelayMs == nil {
+		cfg.BatchDelayMs = intPtr(200)
 	}
-	if cfg.MaxRetries == 0 {
-		cfg.MaxRetries = 5
+	if cfg.MaxRetries == nil {
+		cfg.MaxRetries = intPtr(5)
 	}
-	if cfg.RetryBackoffMs == 0 {
-		cfg.RetryBackoffMs = 100
+	if cfg.RetryBackoffMs == nil {
+		cfg.RetryBackoffMs = intPtr(100)
 	}
 	if cfg.MetricsPort == 0 {
 		cfg.MetricsPort = 9090
 	}
 }
 
-// configPath returns the config file path from -config flag or KAHOUSE_CONFIG env var.
-// Defaults to "kahouse.yaml".
-func configPath() string {
-	path := flag.String("config", "", "path to config file (default: kahouse.yaml or KAHOUSE_CONFIG)")
-	flag.Parse()
-
-	if *path != "" {
-		return *path
+// ConfigPath returns the config file path from -config flag or KAHOUSE_CONFIG env var.
+// Defaults to "kahouse.yaml". Call flag.Parse() before calling this.
+func ConfigPath() string {
+	if *configFlag != "" {
+		return *configFlag
 	}
 	if env := os.Getenv("KAHOUSE_CONFIG"); env != "" {
 		return env
@@ -141,9 +138,9 @@ func configPath() string {
 	return "kahouse.yaml"
 }
 
-func loadConfig() (*Config, error) {
-	path := configPath()
+var configFlag = flag.String("config", "", "path to config file (default: kahouse.yaml or KAHOUSE_CONFIG)")
 
+func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file %q: %w", path, err)
@@ -158,12 +155,12 @@ func loadConfig() (*Config, error) {
 	cfg.InputFormat = normalizeInputFormat(cfg.InputFormat)
 	cfg.StringValueColumn = strings.TrimSpace(cfg.StringValueColumn)
 
-	if err := validateConfig(&cfg); err != nil {
-		return nil, err
-	}
-
 	for i := range cfg.TopicTables {
 		cfg.TopicTables[i].resolve(&cfg)
+	}
+
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
 	}
 
 	return &cfg, nil
@@ -199,14 +196,14 @@ func validateConfig(cfg *Config) error {
 	if cfg.BatchSize < 1 {
 		return fmt.Errorf("batch_size must be at least 1, got %d", cfg.BatchSize)
 	}
-	if cfg.BatchDelayMs < 0 {
-		return fmt.Errorf("batch_delay_ms must be >= 0, got %d", cfg.BatchDelayMs)
+	if *cfg.BatchDelayMs < 0 {
+		return fmt.Errorf("batch_delay_ms must be >= 0, got %d", *cfg.BatchDelayMs)
 	}
-	if cfg.MaxRetries < 0 {
-		return fmt.Errorf("max_retries must be >= 0, got %d", cfg.MaxRetries)
+	if *cfg.MaxRetries < 0 {
+		return fmt.Errorf("max_retries must be >= 0, got %d", *cfg.MaxRetries)
 	}
-	if cfg.RetryBackoffMs < 0 {
-		return fmt.Errorf("retry_backoff_ms must be >= 0, got %d", cfg.RetryBackoffMs)
+	if *cfg.RetryBackoffMs < 0 {
+		return fmt.Errorf("retry_backoff_ms must be >= 0, got %d", *cfg.RetryBackoffMs)
 	}
 	if len(cfg.TopicTables) == 0 {
 		return fmt.Errorf("at least one topic_tables mapping is required")
@@ -224,34 +221,24 @@ func validateConfig(cfg *Config) error {
 		if strings.TrimSpace(tt.Table) == "" {
 			return fmt.Errorf("topic_tables[%d]: table is required", i)
 		}
-		format := normalizeInputFormat(tt.Format)
-		if format == "" {
-			format = cfg.InputFormat
-		}
-		switch format {
+		switch tt.Format {
 		case "avro", "json", "string":
 		default:
 			return fmt.Errorf("topic_tables[%d]: format must be one of avro, json, or string, got %q", i, tt.Format)
 		}
-		if format == "string" {
-			stringValueColumn := strings.TrimSpace(tt.StringValueColumn)
-			if stringValueColumn == "" {
-				stringValueColumn = cfg.StringValueColumn
-			}
-			if stringValueColumn == "" {
-				return fmt.Errorf("topic_tables[%d]: string_value_column is required when format is string", i)
-			}
+		if tt.Format == "string" && tt.StringValueColumn == "" {
+			return fmt.Errorf("topic_tables[%d]: string_value_column is required when format is string", i)
 		}
-		if tt.BatchSize != nil && *tt.BatchSize < 1 {
+		if *tt.BatchSize < 1 {
 			return fmt.Errorf("topic_tables[%d]: batch_size must be at least 1, got %d", i, *tt.BatchSize)
 		}
-		if tt.BatchDelayMs != nil && *tt.BatchDelayMs < 0 {
+		if *tt.BatchDelayMs < 0 {
 			return fmt.Errorf("topic_tables[%d]: batch_delay_ms must be >= 0, got %d", i, *tt.BatchDelayMs)
 		}
-		if tt.MaxRetries != nil && *tt.MaxRetries < 0 {
+		if *tt.MaxRetries < 0 {
 			return fmt.Errorf("topic_tables[%d]: max_retries must be >= 0, got %d", i, *tt.MaxRetries)
 		}
-		if tt.RetryBackoffMs != nil && *tt.RetryBackoffMs < 0 {
+		if *tt.RetryBackoffMs < 0 {
 			return fmt.Errorf("topic_tables[%d]: retry_backoff_ms must be >= 0, got %d", i, *tt.RetryBackoffMs)
 		}
 	}
@@ -276,9 +263,9 @@ func configLogFields(cfg *Config) []interface{} {
 		"kafka_sasl_password", redactSecret(cfg.KafkaSASLPassword),
 		"kafka_ssl_ca_location", cfg.KafkaSSLCALocation,
 		"batch_size", cfg.BatchSize,
-		"batch_delay_ms", cfg.BatchDelayMs,
-		"max_retries", cfg.MaxRetries,
-		"retry_backoff_ms", cfg.RetryBackoffMs,
+		"batch_delay_ms", *cfg.BatchDelayMs,
+		"max_retries", *cfg.MaxRetries,
+		"retry_backoff_ms", *cfg.RetryBackoffMs,
 		"topic_tables", cfg.TopicTables,
 	}
 }
@@ -288,13 +275,8 @@ func normalizeInputFormat(value string) string {
 }
 
 func anyTopicUsesFormat(cfg *Config, format string) bool {
-	format = normalizeInputFormat(format)
-	for _, topicTable := range cfg.TopicTables {
-		topicFormat := normalizeInputFormat(topicTable.Format)
-		if topicFormat == "" {
-			topicFormat = cfg.InputFormat
-		}
-		if topicFormat == format {
+	for _, tt := range cfg.TopicTables {
+		if tt.Format == format {
 			return true
 		}
 	}

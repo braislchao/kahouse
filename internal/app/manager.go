@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -129,16 +130,17 @@ func (m *TaskManager) Start(topic string) error {
 		return fmt.Errorf("cannot start topic %q: process is shutting down", topic)
 	}
 
-	m.mu.RLock()
+	m.mu.Lock()
 	mt, exists := m.tasks[topic]
-	m.mu.RUnlock()
-
 	if !exists {
+		m.mu.Unlock()
 		return fmt.Errorf("topic %q not found", topic)
 	}
 	if !mt.task.IsStopped() {
+		m.mu.Unlock()
 		return fmt.Errorf("topic %q is already running", topic)
 	}
+	m.mu.Unlock()
 
 	<-mt.done // ensure previous Run has fully returned
 	return m.startTask(mt.mapping)
@@ -249,7 +251,11 @@ func (m *TaskManager) handleListTopics(w http.ResponseWriter, _ *http.Request) {
 func (m *TaskManager) handleStopTopic(w http.ResponseWriter, r *http.Request) {
 	topic := r.PathValue("topic")
 	if err := m.Stop(topic); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -261,7 +267,9 @@ func (m *TaskManager) handleStartTopic(w http.ResponseWriter, r *http.Request) {
 	if err := m.Start(topic); err != nil {
 		m.logger.Errorf("Failed to start topic %s: %v", topic, err)
 		status := http.StatusInternalServerError
-		if mt, exists := m.tasks[topic]; exists && !mt.task.IsStopped() {
+		if strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "already running") {
 			status = http.StatusConflict
 		}
 		http.Error(w, err.Error(), status)

@@ -6,13 +6,12 @@ import (
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"go.uber.org/zap"
 )
 
 const dlqDeliveryTimeout = 30 * time.Second
 
 // sendToDLQ sends a single message to the DLQ topic (used for per-message deserialization errors).
-func sendToDLQ(producer *kafka.Producer, topic string, dlqSuffix string, key, value []byte, errorMsg string, sugar *zap.SugaredLogger) error {
+func sendToDLQ(producer *kafka.Producer, topic string, dlqSuffix string, key, value []byte, errorMsg string) error {
 	dlqTopic := topic + dlqSuffix
 	dlqRecord := map[string]interface{}{
 		"original_topic": topic,
@@ -23,7 +22,6 @@ func sendToDLQ(producer *kafka.Producer, topic string, dlqSuffix string, key, va
 	}
 	payload, err := json.Marshal(dlqRecord)
 	if err != nil {
-		sugar.Errorf("Failed to marshal DLQ record: %v", err)
 		return fmt.Errorf("failed to marshal DLQ record: %w", err)
 	}
 	return produceAndWait(producer, &kafka.Message{

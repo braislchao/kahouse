@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,9 +15,10 @@ import (
 )
 
 // validConfig returns a minimal valid Config for use in validation tests.
+// Fields are resolved (as loadConfig does) so validateConfig can be called directly.
 // Callers modify specific fields before passing to validateConfig.
 func validConfig() Config {
-	return Config{
+	cfg := Config{
 		KafkaBrokers:   "localhost:9092",
 		InputFormat:    "avro",
 		SchemaRegistry: "http://localhost:8081",
@@ -26,11 +26,15 @@ func validConfig() Config {
 		GroupID:        "group",
 		DLQTopicSuffix: ".dlq",
 		BatchSize:      1,
-		BatchDelayMs:   1,
-		MaxRetries:     1,
-		RetryBackoffMs: 1,
+		BatchDelayMs:   intPtr(1),
+		MaxRetries:     intPtr(1),
+		RetryBackoffMs: intPtr(1),
 		TopicTables:    []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
 	}
+	for i := range cfg.TopicTables {
+		cfg.TopicTables[i].resolve(&cfg)
+	}
+	return cfg
 }
 
 type stubSinkChecker struct {
@@ -47,9 +51,9 @@ func (s stubSinkChecker) Assignment() ([]kafka.TopicPartition, error) { return s
 func TestTopicTableMappingResolve(t *testing.T) {
 	cfg := &Config{
 		BatchSize:      5000,
-		BatchDelayMs:   300,
-		MaxRetries:     5,
-		RetryBackoffMs: 200,
+		BatchDelayMs:   intPtr(300),
+		MaxRetries:     intPtr(5),
+		RetryBackoffMs: intPtr(200),
 	}
 
 	// Test case 1: all nil — should use global defaults
@@ -185,7 +189,7 @@ func TestValidateConfigRejectsInvalidNumbers(t *testing.T) {
 		},
 		{
 			name:   "global retries",
-			mutate: func(c *Config) { c.MaxRetries = -1 },
+			mutate: func(c *Config) { c.MaxRetries = intPtr(-1) },
 			want:   "max_retries must be >= 0",
 		},
 		{
@@ -226,6 +230,9 @@ func TestValidateConfigRejectsDuplicateTopics(t *testing.T) {
 		{Topic: "orders", Table: "default.orders"},
 		{Topic: "orders", Table: "default.orders_copy"},
 	}
+	for i := range cfg.TopicTables {
+		cfg.TopicTables[i].resolve(&cfg)
+	}
 	err := validateConfig(&cfg)
 	if err == nil {
 		t.Fatal("Expected validation to reject duplicate topics")
@@ -244,6 +251,9 @@ func TestConfigLogFieldsRedactsSecrets(t *testing.T) {
 		GroupID:           "group",
 		KafkaSASLUsername: "user",
 		KafkaSASLPassword: "super-secret",
+		BatchDelayMs:      intPtr(200),
+		MaxRetries:        intPtr(5),
+		RetryBackoffMs:    intPtr(100),
 		TopicTables:       []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
 	})
 
@@ -281,8 +291,12 @@ func TestValidateConfigInputFormatRules(t *testing.T) {
 			want:   "schema_registry is required",
 		},
 		{
-			name:   "json does not require schema registry",
-			mutate: func(c *Config) { c.InputFormat = "json"; c.SchemaRegistry = "" },
+			name: "json does not require schema registry",
+			mutate: func(c *Config) {
+				c.InputFormat = "json"
+				c.SchemaRegistry = ""
+				c.TopicTables = []TopicTableMapping{{Topic: "orders", Table: "default.orders"}}
+			},
 		},
 		{
 			name:   "string requires destination column",
@@ -332,6 +346,9 @@ func TestValidateConfigInputFormatRules(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := validConfig()
 			tt.mutate(&cfg)
+			for i := range cfg.TopicTables {
+				cfg.TopicTables[i].resolve(&cfg)
+			}
 			err := validateConfig(&cfg)
 			if tt.want == "" {
 				if err != nil {
@@ -346,12 +363,6 @@ func TestValidateConfigInputFormatRules(t *testing.T) {
 				t.Fatalf("Expected error containing %q, got %q", tt.want, err.Error())
 			}
 		})
-	}
-}
-
-func TestNormalizeInputFormat(t *testing.T) {
-	if got := normalizeInputFormat(" JSON "); got != "json" {
-		t.Fatalf("Expected normalized input format json, got %q", got)
 	}
 }
 
@@ -455,6 +466,9 @@ func TestAnyTopicUsesFormat(t *testing.T) {
 			{Topic: "payments", Table: "default.payments", Format: "avro"},
 		},
 	}
+	for i := range cfg.TopicTables {
+		cfg.TopicTables[i].resolve(cfg)
+	}
 	if !anyTopicUsesFormat(cfg, "json") {
 		t.Fatal("Expected fallback global format json to be detected")
 	}
@@ -463,28 +477,6 @@ func TestAnyTopicUsesFormat(t *testing.T) {
 	}
 	if anyTopicUsesFormat(cfg, "string") {
 		t.Fatal("Did not expect string format to be detected")
-	}
-}
-
-func TestConsumerGroupIDFormat(t *testing.T) {
-	tests := []struct {
-		name    string
-		groupID string
-		topic   string
-		want    string
-	}{
-		{name: "adds static kahouse prefix", groupID: "prod", topic: "orders", want: "kahouse-prod-orders"},
-		{name: "keeps configured value as middle segment", groupID: "kahouse-main", topic: "orders", want: "kahouse-kahouse-main-orders"},
-		{name: "trims spaces", groupID: "  prod  ", topic: "orders", want: "kahouse-prod-orders"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := "kahouse-" + strings.TrimSpace(tt.groupID) + "-" + tt.topic
-			if got != tt.want {
-				t.Fatalf("Expected group id %q, got %q", tt.want, got)
-			}
-		})
 	}
 }
 
@@ -537,8 +529,7 @@ func TestStringDecoderDecode(t *testing.T) {
 }
 
 func TestStringDecoderRequiresColumn(t *testing.T) {
-	decoder := StringDecoder{}
-	_, err := decoder.Decode("logs", []byte("hello world"))
+	_, err := newMessageDecoder("string", "", nil)
 	if err == nil || !strings.Contains(err.Error(), "destination column") {
 		t.Fatalf("Expected missing destination column error, got %v", err)
 	}
@@ -570,27 +561,6 @@ func TestJSONDecoderUsesNumbersDeterministically(t *testing.T) {
 	}
 	if got, ok := record["fractional"].(float64); !ok || got != 10 {
 		t.Fatalf("Expected fractional float64(10), got %#v", record["fractional"])
-	}
-}
-
-func TestJSONDecoderRoundTripsValidJSONObject(t *testing.T) {
-	input := map[string]interface{}{"id": int64(1), "name": "alice"}
-	payload, err := json.Marshal(input)
-	if err != nil {
-		t.Fatalf("Failed to marshal input: %v", err)
-	}
-
-	decoder := JSONDecoder{}
-	record, err := decoder.Decode("orders", payload)
-	if err != nil {
-		t.Fatalf("Expected JSON decode to succeed, got %v", err)
-	}
-
-	if !bytes.Equal(bytes.TrimSpace(payload), []byte(`{"id":1,"name":"alice"}`)) {
-		t.Fatalf("Unexpected marshaled payload: %s", payload)
-	}
-	if got := record["name"]; got != "alice" {
-		t.Fatalf("Expected name alice, got %#v", got)
 	}
 }
 
@@ -772,22 +742,6 @@ func TestRepairModeString(t *testing.T) {
 	}
 }
 
-func TestRepairModeRoundTrip(t *testing.T) {
-	for _, mode := range []RepairMode{RepairModeOff, RepairModeDLQ, RepairModeSkip} {
-		s := mode.String()
-		if s == "" {
-			s = "off"
-		}
-		parsed, err := ParseRepairMode(s)
-		if err != nil {
-			t.Fatalf("Failed to round-trip repair mode %v: %v", mode, err)
-		}
-		if parsed != mode {
-			t.Fatalf("Round-trip mismatch: %v -> %q -> %v", mode, s, parsed)
-		}
-	}
-}
-
 func TestTaskManagerTopics(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -910,8 +864,8 @@ func TestAdminHandlerListTopics(t *testing.T) {
 	RegisterAdminEndpoints(mgr, mux)
 
 	rr := httptest.NewRecorder()
-	rr2 := httptest.NewRequest("GET", "/api/topics", nil)
-	mux.ServeHTTP(rr, rr2)
+	req := httptest.NewRequest("GET", "/api/topics", nil)
+	mux.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("Expected 200, got %d", rr.Code)

@@ -18,7 +18,7 @@ import (
 )
 
 func Run() {
-	cfg, err := loadConfig()
+	cfg, err := loadConfig(ConfigPath())
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
@@ -58,23 +58,27 @@ func Run() {
 		}
 		srClient, err = schemaregistry.NewClient(srCfg)
 		if err != nil {
-			sugar.Fatalf("Failed to create Schema Registry client: %v", err)
+			sugar.Errorf("Failed to create Schema Registry client: %v", err)
+			return
 		}
 	}
 
 	// Shared ClickHouse connection
 	chOptions, err := clickhouse.ParseDSN(cfg.ClickHouseDSN)
 	if err != nil {
-		sugar.Fatalf("Failed to parse ClickHouse DSN: %v", err)
+		sugar.Errorf("Failed to parse ClickHouse DSN: %v", err)
+		return
 	}
 	chConn, err := clickhouse.Open(chOptions)
 	if err != nil {
-		sugar.Fatalf("Failed to open ClickHouse connection: %v", err)
+		sugar.Errorf("Failed to open ClickHouse connection: %v", err)
+		return
 	}
 	defer chConn.Close()
 
 	if err := chConn.Ping(context.Background()); err != nil {
-		sugar.Fatalf("Failed to ping ClickHouse: %v", err)
+		sugar.Errorf("Failed to ping ClickHouse: %v", err)
+		return
 	}
 	sugar.Info("Connected to ClickHouse")
 
@@ -84,7 +88,8 @@ func Run() {
 	}, cfg)
 	dlqProducer, err := kafka.NewProducer(&dlqKafkaConfig)
 	if err != nil {
-		sugar.Fatalf("Failed to create Kafka producer for DLQ: %v", err)
+		sugar.Errorf("Failed to create Kafka producer for DLQ: %v", err)
+		return
 	}
 	defer dlqProducer.Close()
 
@@ -97,7 +102,8 @@ func Run() {
 	// Create and start the task manager
 	mgr := NewTaskManager(ctx, cfg, chConn, srClient, dlqProducer, sugar)
 	if err := mgr.StartAll(); err != nil {
-		sugar.Fatalf("Failed to start sink tasks: %v", err)
+		sugar.Errorf("Failed to start sink tasks: %v", err)
+		return
 	}
 
 	// Start metrics, health, and admin server. If it fails to bind (e.g. port conflict),

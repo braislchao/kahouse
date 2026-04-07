@@ -69,27 +69,22 @@ type SinkTask struct {
 	repairMode     atomic.Int32
 }
 
-// IsStopped reports whether the sink task has stopped running.
 func (t *SinkTask) IsStopped() bool {
 	return t.stopped.Load()
 }
 
-// TopicName returns the Kafka topic this task consumes.
 func (t *SinkTask) TopicName() string {
 	return t.mapping.Topic
 }
 
-// Assignment returns the current partition assignment for this task's consumer.
 func (t *SinkTask) Assignment() ([]kafka.TopicPartition, error) {
 	return t.consumer.Assignment()
 }
 
-// SetRepairMode atomically sets the repair mode for this task.
 func (t *SinkTask) SetRepairMode(mode RepairMode) {
 	t.repairMode.Store(int32(mode))
 }
 
-// GetRepairMode atomically reads the current repair mode.
 func (t *SinkTask) GetRepairMode() RepairMode {
 	return RepairMode(t.repairMode.Load())
 }
@@ -214,7 +209,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 				t.sugar.Errorf("Decode error in strict mode, stopping task for topic %s", topic)
 				return
 			case RepairModeDLQ:
-				if dlqErr := sendToDLQ(t.dlqProducer, topic, t.dlqTopicSuffix, msg.Key, msg.Value, err.Error(), t.sugar); dlqErr != nil {
+				if dlqErr := sendToDLQ(t.dlqProducer, topic, t.dlqTopicSuffix, msg.Key, msg.Value, err.Error()); dlqErr != nil {
 					t.sugar.Errorf("Failed to send message to DLQ: %v", dlqErr)
 					return
 				}
@@ -261,7 +256,7 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 	defer flushCancel()
 
 	writeStart := time.Now()
-	writeErr, attempts := t.writeWithRetries(flushCtx, table, batch)
+	attempts, writeErr := t.writeWithRetries(flushCtx, table, batch)
 
 	processLatency.WithLabelValues(topic).Observe(time.Since(writeStart).Seconds())
 	batchSizeHist.WithLabelValues(topic).Observe(float64(len(batch)))
@@ -297,7 +292,7 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 
 // writeWithRetries attempts to write the batch, retrying with exponential backoff+jitter.
 // Returns the final error (nil on success) and the number of attempts made.
-func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []map[string]interface{}) (error, int) {
+func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []map[string]interface{}) (int, error) {
 	maxRetries := *t.mapping.MaxRetries
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -309,19 +304,19 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 			case <-timer.C:
 			case <-ctx.Done():
 				timer.Stop()
-				return ctx.Err(), attempt
+				return attempt, ctx.Err()
 			}
 			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, wait)
 		}
-		if err := writeBatch(ctx, table, t.chConn, batch, t.sugar); err != nil {
+		if err := writeBatch(ctx, table, t.chConn, batch); err != nil {
 			if attempt == maxRetries {
 				t.sugar.Errorf("Batch write failed on final attempt %d/%d: %v", attempt+1, maxRetries+1, err)
-				return err, attempt + 1
+				return attempt + 1, err
 			}
 			t.sugar.Warnf("Batch write failed on attempt %d/%d: %v", attempt+1, maxRetries+1, err)
 			continue
 		}
-		return nil, attempt + 1
+		return attempt + 1, nil
 	}
-	return fmt.Errorf("writeWithRetries: no attempts made (maxRetries=%d)", maxRetries), 0
+	return 0, fmt.Errorf("writeWithRetries: no attempts made (maxRetries=%d)", maxRetries)
 }

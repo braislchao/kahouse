@@ -24,6 +24,9 @@ func newMessageDecoder(format string, stringValueColumn string, srClient schemar
 	case "json":
 		return JSONDecoder{}, nil
 	case "string":
+		if strings.TrimSpace(stringValueColumn) == "" {
+			return nil, fmt.Errorf("string decoder requires a destination column")
+		}
 		return StringDecoder{column: stringValueColumn}, nil
 	default:
 		return nil, fmt.Errorf("unsupported input format %q", format)
@@ -121,8 +124,5 @@ type StringDecoder struct {
 }
 
 func (d StringDecoder) Decode(_ string, payload []byte) (map[string]interface{}, error) {
-	if strings.TrimSpace(d.column) == "" {
-		return nil, fmt.Errorf("string decoder requires a destination column")
-	}
 	return map[string]interface{}{d.column: string(payload)}, nil
 }

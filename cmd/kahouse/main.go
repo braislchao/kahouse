@@ -1,7 +1,12 @@
 package main
 
-import "github.com/braislchao/kahouse/internal/app"
+import (
+	"flag"
+
+	"github.com/braislchao/kahouse/internal/app"
+)
 
 func main() {
+	flag.Parse()
 	app.Run()
 }

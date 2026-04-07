@@ -8,7 +8,6 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	"go.uber.org/zap"
 )
 
 // quoteIdentifier wraps a ClickHouse identifier in backticks, escaping any
@@ -37,7 +36,7 @@ func quoteTableIdentifier(name string) (string, error) {
 }
 
 // writeBatch writes a batch of records to a ClickHouse table.
-func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, sugar *zap.SugaredLogger) error {
+func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}) error {
 	if len(batch) == 0 {
 		return nil
 	}

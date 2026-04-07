@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
@@ -102,13 +103,7 @@ func isAvroUnionBranch(branch string) bool {
 	if _, ok := avroPrimitiveUnionBranches[branch]; ok {
 		return true
 	}
-	// Named union branches are schema full names (commonly dot-qualified).
-	for i := 0; i < len(branch); i++ {
-		if branch[i] == '.' {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(branch, ".")
 }
 
 func (d *AvroDecoder) codecFor(topic string, schemaID int) (*goavro.Codec, error) {
