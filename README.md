@@ -4,47 +4,12 @@ A lightweight Go service that sinks Kafka topics into ClickHouse tables. Each to
 
 ```mermaid
 graph LR
-    subgraph Kafka
-        T1[Topic A]
-        T2[Topic B]
-        T3[Topic N]
-    end
+    T1[Orders Topic]:::kafka --> C1[Consumer]:::pipeline --> D1[Decoder]:::pipeline --> B1[Batch Buffer]:::pipeline --> CH1[(orders)]:::clickhouse
+    T2[Payments Topic]:::kafka --> C2[Consumer]:::pipeline --> D2[Decoder]:::pipeline --> B2[Batch Buffer]:::pipeline --> CH2[(payments)]:::clickhouse
 
-    subgraph "Sink Task A — isolated"
-        C1[Consumer A] --> D1[Decoder] --> B1[Batch Buffer]
-    end
-
-    subgraph "Sink Task B — isolated"
-        C2[Consumer B] --> D2[Decoder] --> B2[Batch Buffer]
-    end
-
-    subgraph "Sink Task N — isolated"
-        C3[Consumer N] --> D3[Decoder] --> B3[Batch Buffer]
-    end
-
-    subgraph ClickHouse
-        CH1[(Table A)]
-        CH2[(Table B)]
-        CH3[(Table N)]
-    end
-
-    subgraph DLQ
-        DLQ1[Topic A.dlq]
-        DLQ2[Topic B.dlq]
-        DLQ3[Topic N.dlq]
-    end
-
-    T1 --> C1
-    T2 --> C2
-    T3 --> C3
-
-    B1 -- flush --> CH1
-    B2 -- flush --> CH2
-    B3 -- flush --> CH3
-
-    B1 -. "write failure<br/>after retries" .-> DLQ1
-    B2 -. "write failure<br/>after retries" .-> DLQ2
-    B3 -. "write failure<br/>after retries" .-> DLQ3
+    classDef kafka fill:#ff6b35,stroke:#c44d1a,color:#fff
+    classDef pipeline fill:#4a90d9,stroke:#2c6fad,color:#fff
+    classDef clickhouse fill:#f5c542,stroke:#c49a1a,color:#333
 ```
 
 Each sink task runs two goroutines: a **consumer loop** that reads and decodes messages, and a **batch processor** that accumulates records and flushes them to ClickHouse when a size or time threshold is reached. On write failure, retries with exponential backoff are attempted before forwarding to a Dead Letter Queue. Decode errors (bad data, schema mismatch) **stop the task** by default -- use [repair mode](#repair-mode) to route them to the DLQ instead.
