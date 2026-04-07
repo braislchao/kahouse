@@ -34,7 +34,7 @@ graph LR
     classDef clickhouse fill:#f5c542,stroke:#c49a1a,color:#333
 ```
 
-Each topic gets its own sink task with an independent consumer, decoder, and batch buffer. A sink task runs a single loop: read a message, decode it, buffer it, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task -- the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying.
+Each topic gets its own sink task with an independent consumer, decoder, and batch buffer. A sink task runs a single loop: read a message, decode it, buffer it, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task, the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying. Consumer group separation ensures full offset isolation between topics.
 
 Delivery is **at-least-once**. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered. Deduplication is your responsibility (e.g. `ReplacingMergeTree` with an application-level key).
 
@@ -92,11 +92,11 @@ See `config.yaml.example` for a full annotated example.
 
 ### Per-topic overrides
 
-Each topic can override `format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, and `retry_backoff_ms`. Omit a field to inherit the global default. Setting a field to `0` is valid and takes effect (it is not treated as "not set").
+Each topic can override `format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, and `retry_backoff_ms`. Omit a field to inherit the global default.
 
 ### Kafka authentication
 
-SASL and TLS are supported. All auth fields are optional -- omit them for unauthenticated clusters.
+SASL and TLS are supported. All auth fields are optional.
 
 ```yaml
 kafka_security_protocol: "SASL_SSL"
@@ -113,11 +113,9 @@ schema_registry_username: "your-sr-api-key"
 schema_registry_password: "your-sr-api-secret"
 ```
 
-Each topic gets its own consumer group in the format `kahouse-<group_id>-<topic>`, ensuring full offset isolation between topics.
-
 ## ClickHouse
 
-Table columns must match the fields in the decoded messages. kahouse does not inject any metadata columns -- your table schema is entirely up to you.
+Table columns must match the fields in the decoded messages.
 
 ```sql
 CREATE TABLE default.orders (
@@ -136,7 +134,7 @@ Async inserts are enabled by default (`async_insert=1, wait_for_async_insert=1`)
 
 Write failures are retried with exponential backoff. If all retries are exhausted, the task stops. Since Kafka retains messages, restarting the task replays from the last committed offset.
 
-Decode errors (bad JSON, schema mismatch, corrupted payload) also **stop the task** by default. This is intentional -- bad data in a data warehouse should be investigated, not silently discarded. When the cause is known and you need to unblock consumption, use repair mode.
+Decode errors (bad JSON, schema mismatch, corrupted payload) also **stop the task** by default. This is intentional -- bad data should be investigated. When the cause is known and you need to unblock consumption, use repair mode.
 
 ### Repair mode
 
@@ -151,7 +149,7 @@ Repair mode resets to off when a topic is restarted, preventing forgotten repair
 
 ### Dead letter queue
 
-When repair mode is set to `dlq`, bad messages are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`). Write failures never go to the DLQ -- they always stop the task.
+When repair mode is set to `dlq`, bad messages are forwarded to `<topic><dlq_topic_suffix>` (default: `<topic>.dlq`).
 
 Each DLQ record is a JSON object:
 
