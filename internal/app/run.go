@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -95,47 +94,37 @@ func Run() {
 		}
 	}()
 
-	// Create and start sink tasks
-	var wg sync.WaitGroup
-	var consumers []*kafka.Consumer
-
-	for _, mapping := range cfg.TopicTables {
-		task, err := NewSinkTask(mapping, cfg, chConn, srClient, dlqProducer, cancel, sugar)
-		if err != nil {
-			sugar.Fatalf("Failed to create sink task for topic %s: %v", mapping.Topic, err)
-		}
-
-		consumers = append(consumers, task.consumer)
-		wg.Add(1)
-		go task.Run(ctx, &wg)
-
-		sugar.Infof("Started sink task: topic=%s table=%s format=%s", mapping.Topic, mapping.Table, mapping.Format)
+	// Create and start the task manager
+	mgr := NewTaskManager(ctx, cfg, chConn, srClient, dlqProducer, sugar)
+	if err := mgr.StartAll(); err != nil {
+		sugar.Fatalf("Failed to start sink tasks: %v", err)
 	}
 
-	// Start metrics and health server. If it fails to bind (e.g. port conflict), cancel the
-	// context so the process exits cleanly rather than running silently without observability.
+	// Start metrics, health, and admin server. If it fails to bind (e.g. port conflict),
+	// cancel the context so the process exits cleanly rather than running without observability.
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	health := NewHealth(sugar, chConn, consumers)
+	health := NewHealth(sugar, chConn, mgr.Snapshot)
 	RegisterHealthEndpoints(health, mux)
+	RegisterAdminEndpoints(mgr, mux)
 
 	addr := fmt.Sprintf(":%d", cfg.MetricsPort)
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() {
-		sugar.Infof("Starting metrics and health server on %s", addr)
+		sugar.Infof("Starting metrics, health, and admin server on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			sugar.Errorf("Metrics/health server failed: %v — triggering shutdown", err)
+			sugar.Errorf("Server failed: %v — triggering shutdown", err)
 			cancel()
 		}
 	}()
 
 	sugar.Info("All sink tasks started, waiting for shutdown signal")
-	wg.Wait()
+	mgr.Wait()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		sugar.Errorf("Metrics/health server shutdown error: %v", err)
+		sugar.Errorf("Server shutdown error: %v", err)
 	}
 
 	sugar.Info("All sink tasks stopped, exiting")

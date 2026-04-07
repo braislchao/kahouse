@@ -48,6 +48,16 @@ var (
 		Help:      "Number of retry attempts per ClickHouse batch write",
 		Buckets:   prometheus.LinearBuckets(0, 1, 11),
 	}, []string{"topic"})
+	taskStopped = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "kahouse",
+		Name:      "task_stopped",
+		Help:      "Whether a sink task has stopped (1 = stopped, 0 = running)",
+	}, []string{"topic"})
+	taskRestartsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "kahouse",
+		Name:      "task_restarts_total",
+		Help:      "Total number of times a sink task has been restarted via the admin API",
+	}, []string{"topic"})
 )
 
 func init() {
@@ -60,5 +70,7 @@ func init() {
 		batchDelayHist,
 		processLatency,
 		retryCountHist,
+		taskStopped,
+		taskRestartsTotal,
 	)
 }
