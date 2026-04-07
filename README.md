@@ -40,17 +40,7 @@ Each sink task runs two goroutines: a **consumer loop** that reads and decodes m
 
 ### Delivery semantics
 
-kahouse provides **at-least-once** delivery. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered.
-
-To handle duplicates, kahouse injects three metadata columns into every record:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `kafka_topic` | `String` | Source topic |
-| `kafka_partition` | `Int32` | Source partition |
-| `kafka_offset` | `Int64` | Source offset |
-
-Using `ReplacingMergeTree` with `ORDER BY (kafka_topic, kafka_partition, kafka_offset)` gives practical deduplication -- ClickHouse merges away duplicates in the background. Use `FINAL` in queries when exact results are needed before a merge has run.
+kahouse provides **at-least-once** delivery. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered. Deduplication is the responsibility of the downstream table design (e.g. `ReplacingMergeTree` with an application-level key).
 
 ## Quick start
 
@@ -131,21 +121,15 @@ export KAHOUSE_TOPIC_TABLES='[{"topic":"orders","table":"default.orders","format
 
 ## ClickHouse table requirements
 
-Tables must include the three metadata columns for offset tracking and deduplication. Use `ReplacingMergeTree` ordered by these columns:
+Table columns must match the fields in the decoded messages. kahouse does not inject any metadata columns -- your table schema is entirely up to you.
 
 ```sql
 CREATE TABLE default.orders (
-    -- your data columns
     id        Int64,
     name      String,
-    price     Float64,
-
-    -- required metadata columns
-    kafka_topic     String,
-    kafka_partition Int32,
-    kafka_offset    Int64
-) ENGINE = ReplacingMergeTree()
-ORDER BY (kafka_topic, kafka_partition, kafka_offset)
+    price     Float64
+) ENGINE = MergeTree()
+ORDER BY id
 ```
 
 For `Nullable` Avro fields, use `Nullable(T)` column types. For sparse JSON (where records may have different keys), all columns that might be absent should be `Nullable`.

@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,7 +65,6 @@ type SinkTask struct {
 	dlqProducer    *kafka.Producer
 	consumer       *kafka.Consumer
 	sugar          *zap.SugaredLogger
-	msgChan        chan map[string]interface{}
 	stopped        atomic.Bool
 	repairMode     atomic.Int32
 }
@@ -129,13 +127,6 @@ func NewSinkTask(
 		return nil, fmt.Errorf("failed to subscribe to topic %s: %w", mapping.Topic, err)
 	}
 
-	// Channel capacity is 2× BatchSize so the consumer can keep reading while a batch write is
-	// in flight. Floor at 1000 for very small batch sizes.
-	chanCap := *mapping.BatchSize * 2
-	if chanCap < 1000 {
-		chanCap = 1000
-	}
-
 	return &SinkTask{
 		mapping:        mapping,
 		dlqTopicSuffix: cfg.DLQTopicSuffix,
@@ -144,51 +135,54 @@ func NewSinkTask(
 		dlqProducer:    dlqProducer,
 		consumer:       consumer,
 		sugar:          sugar.With("topic", mapping.Topic),
-		msgChan:        make(chan map[string]interface{}, chanCap),
 	}, nil
 }
 
-// Run starts the consumer loop and batch processor.
-// Each task gets its own cancellable context derived from the parent, so stopping
-// one task (e.g. due to an unrecoverable error) does not affect other tasks.
+// Run reads messages from Kafka, accumulates them into batches, and flushes to ClickHouse.
+// Batches are flushed when they reach batch_size or after batch_delay_ms of inactivity.
+// After a successful write, offsets are committed via the consumer group protocol.
 func (t *SinkTask) Run(ctx context.Context) {
 	defer t.consumer.Close()
 	defer t.stopped.Store(true)
 	defer taskStopped.WithLabelValues(t.mapping.Topic).Set(1)
 
-	taskCtx, taskCancel := context.WithCancel(ctx)
-	defer taskCancel()
-
-	var batchWg sync.WaitGroup
-	batchWg.Add(1)
-	go t.batchProcessor(taskCtx, taskCancel, &batchWg)
-
-	t.consumerLoop(taskCtx, taskCancel)
-
-	close(t.msgChan)
-	batchWg.Wait()
-}
-
-// consumerLoop reads messages from Kafka and sends them to the batch processor.
-func (t *SinkTask) consumerLoop(ctx context.Context, cancel context.CancelFunc) {
 	topic := t.mapping.Topic
+	table := t.mapping.Table
+	batchSize := *t.mapping.BatchSize
+	batchDelay := time.Duration(*t.mapping.BatchDelayMs) * time.Millisecond
+	if batchDelay <= 0 {
+		batchDelay = time.Millisecond
+	}
+
+	var batch []map[string]interface{}
+	var firstInBatch time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
-			t.sugar.Info("Context closed, stopping consumer loop")
+			t.sugar.Info("Context closed, flushing remaining batch")
+			if len(batch) > 0 {
+				t.flush(context.Background(), table, batch, firstInBatch)
+			}
 			return
 		default:
 		}
 
-		// 100ms timeout lets the loop check ctx.Done() frequently without busy-waiting,
-		// and prevents blocking Kafka heartbeats during slow ClickHouse writes.
+		// 100ms timeout lets the loop check ctx.Done() and batch delay without busy-waiting.
 		msg, err := t.consumer.ReadMessage(100 * time.Millisecond)
 		if err != nil {
 			if kafkaErr, ok := err.(kafka.Error); ok {
 				switch kafkaErr.Code() {
-				case kafka.ErrTimedOut:
-					continue
-				case kafka.ErrPartitionEOF:
+				case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
+					// No message available — check if the batch delay has expired.
+					if len(batch) > 0 && time.Since(firstInBatch) >= batchDelay {
+						t.sugar.Infof("Batch delay reached (%d messages), flushing", len(batch))
+						if !t.flush(ctx, table, batch, firstInBatch) {
+							return
+						}
+						batch = nil
+						firstInBatch = time.Time{}
+					}
 					continue
 				}
 			}
@@ -200,13 +194,10 @@ func (t *SinkTask) consumerLoop(ctx context.Context, cancel context.CancelFunc) 
 		msgConsumed.WithLabelValues(topic).Inc()
 
 		// Tombstone (null-value) message: commit offset and skip.
-		// Without committing, a tombstone at the end of a partition would be replayed
-		// on every restart, incrementing the failed counter indefinitely.
 		if len(msg.Value) == 0 {
 			t.sugar.Warn("Received tombstone message (nil value), committing offset and skipping")
 			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after tombstone: %v", commitErr)
-				cancel()
 				return
 			}
 			continue
@@ -221,12 +212,10 @@ func (t *SinkTask) consumerLoop(ctx context.Context, cancel context.CancelFunc) 
 			switch mode {
 			case RepairModeOff:
 				t.sugar.Errorf("Decode error in strict mode, stopping task for topic %s", topic)
-				cancel()
 				return
 			case RepairModeDLQ:
 				if dlqErr := sendToDLQ(t.dlqProducer, topic, t.dlqTopicSuffix, msg.Key, msg.Value, err.Error(), t.sugar); dlqErr != nil {
 					t.sugar.Errorf("Failed to send message to DLQ: %v", dlqErr)
-					cancel()
 					return
 				}
 				msgDLQ.WithLabelValues(topic).Inc()
@@ -237,125 +226,42 @@ func (t *SinkTask) consumerLoop(ctx context.Context, cancel context.CancelFunc) 
 
 			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after decode error: %v", commitErr)
-				cancel()
 				return
 			}
 			continue
 		}
 
-		// Add idempotency fields used by ReplacingMergeTree deduplication.
-		record["kafka_topic"] = *msg.TopicPartition.Topic
-		record["kafka_partition"] = int32(msg.TopicPartition.Partition)
-		record["kafka_offset"] = int64(msg.TopicPartition.Offset)
-
-		select {
-		case t.msgChan <- record:
-		case <-ctx.Done():
-			t.sugar.Info("Context closed while sending to batch channel")
-			return
-		}
-	}
-}
-
-// batchProcessor accumulates messages and flushes them to ClickHouse.
-func (t *SinkTask) batchProcessor(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	var batch []map[string]interface{}
-	var firstInBatch time.Time
-
-	// Guard against a zero BatchDelayMs causing a zero-duration ticker (which panics).
-	tickDuration := time.Duration(*t.mapping.BatchDelayMs) * time.Millisecond
-	if tickDuration <= 0 {
-		tickDuration = time.Millisecond
-	}
-	batchTicker := time.NewTicker(tickDuration)
-	defer batchTicker.Stop()
-
-	// flush writes the accumulated batch and resets state. Uses a 30s deadline instead of the
-	// parent context so a clean shutdown doesn't abort the final write, but also doesn't hang.
-	flush := func() bool {
 		if len(batch) == 0 {
-			return true
+			firstInBatch = time.Now()
 		}
-		flushStart := time.Now()
-		queueDepthBefore := len(t.msgChan)
-		t.sugar.Infow(
-			"Flushing batch",
-			"batch_size", len(batch),
-			"queue_depth_before", queueDepthBefore,
-			"batch_age_ms", time.Since(firstInBatch).Milliseconds(),
-		)
-		flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer flushCancel()
-		if err := t.writeAndCommitBatch(flushCtx, batch, firstInBatch); err != nil {
-			t.sugar.Errorw(
-				"Failed to write and commit batch",
-				"error", err,
-				"batch_size", len(batch),
-				"flush_duration_ms", time.Since(flushStart).Milliseconds(),
-				"queue_depth_after", len(t.msgChan),
-			)
-			cancel()
-			return false
-		}
-		t.sugar.Infow(
-			"Batch flush completed",
-			"batch_size", len(batch),
-			"flush_duration_ms", time.Since(flushStart).Milliseconds(),
-			"queue_depth_after", len(t.msgChan),
-		)
-		batch = nil
-		firstInBatch = time.Time{}
-		return true
-	}
+		batch = append(batch, record)
 
-	for {
-		select {
-		case msg, ok := <-t.msgChan:
-			if !ok {
-				t.sugar.Info("Message channel closed, flushing remaining messages")
-				flush()
+		if len(batch) >= batchSize {
+			t.sugar.Infof("Batch size reached (%d), flushing", len(batch))
+			if !t.flush(ctx, table, batch, firstInBatch) {
 				return
 			}
-			if len(batch) == 0 {
-				firstInBatch = time.Now()
-				batchTicker.Reset(tickDuration)
-			}
-			batch = append(batch, msg)
-			if len(batch) >= *t.mapping.BatchSize {
-				t.sugar.Infof("Batch size reached (%d), flushing", len(batch))
-				if !flush() {
-					return
-				}
-			}
-		case <-batchTicker.C:
-			if len(batch) > 0 {
-				t.sugar.Infof("Batch delay reached (%d messages), flushing", len(batch))
-				if !flush() {
-					return
-				}
-			}
+			batch = nil
+			firstInBatch = time.Time{}
 		}
 	}
 }
 
-// writeAndCommitBatch writes a batch to ClickHouse with retries, then commits offsets.
-// On write failure it sends the batch to the DLQ and commits offsets only after DLQ delivery succeeds.
-func (t *SinkTask) writeAndCommitBatch(ctx context.Context, batch []map[string]interface{}, firstInBatch time.Time) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
+// flush writes the batch to ClickHouse with retries and commits offsets.
+// Returns true on success, false on failure (caller should stop).
+func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]interface{}, firstInBatch time.Time) bool {
 	topic := t.mapping.Topic
-	table := t.mapping.Table
-	offsets, err := extractOffsets(batch)
-	if err != nil {
-		return fmt.Errorf("failed to extract offsets: %w", err)
-	}
+	flushStart := time.Now()
+	t.sugar.Infow("Flushing batch",
+		"batch_size", len(batch),
+		"batch_age_ms", time.Since(firstInBatch).Milliseconds(),
+	)
+
+	flushCtx, flushCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer flushCancel()
 
 	writeStart := time.Now()
-	writeErr, attempts := t.writeWithRetries(ctx, table, batch)
+	writeErr, attempts := t.writeWithRetries(flushCtx, table, batch)
 
 	processLatency.WithLabelValues(topic).Observe(time.Since(writeStart).Seconds())
 	batchSizeHist.WithLabelValues(topic).Observe(float64(len(batch)))
@@ -364,25 +270,29 @@ func (t *SinkTask) writeAndCommitBatch(ctx context.Context, batch []map[string]i
 
 	if writeErr != nil {
 		msgFailed.WithLabelValues(topic).Add(float64(len(batch)))
-		return fmt.Errorf("batch write failed after %d attempts: %w", attempts, writeErr)
-	} else {
-		msgProduced.WithLabelValues(topic).Add(float64(len(batch)))
+		t.sugar.Errorw("Batch write failed",
+			"error", writeErr,
+			"batch_size", len(batch),
+			"attempts", attempts,
+			"flush_duration_ms", time.Since(flushStart).Milliseconds(),
+		)
+		return false
 	}
 
-	// extractOffsets already returns max_consumed_offset+1 per partition — do not add 1 again.
-	var commitOffsets []kafka.TopicPartition
-	for partition, offset := range offsets {
-		commitOffsets = append(commitOffsets, kafka.TopicPartition{
-			Topic:     &topic,
-			Partition: partition,
-			Offset:    kafka.Offset(offset),
-		})
-	}
-	if _, err := t.consumer.CommitOffsets(commitOffsets); err != nil {
-		return fmt.Errorf("failed to commit offsets: %w", err)
+	msgProduced.WithLabelValues(topic).Add(float64(len(batch)))
+
+	// Commit the consumer's current position. Since no read-ahead happens,
+	// this commits exactly the offsets of the messages in this batch.
+	if _, err := t.consumer.Commit(); err != nil {
+		t.sugar.Errorf("Failed to commit offsets: %v", err)
+		return false
 	}
 
-	return nil
+	t.sugar.Infow("Batch flush completed",
+		"batch_size", len(batch),
+		"flush_duration_ms", time.Since(flushStart).Milliseconds(),
+	)
+	return true
 }
 
 // writeWithRetries attempts to write the batch, retrying with exponential backoff+jitter.
@@ -414,53 +324,4 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 		return nil, attempt + 1
 	}
 	return fmt.Errorf("writeWithRetries: no attempts made (maxRetries=%d)", maxRetries), 0
-}
-
-// extractOffsets returns the next offset to commit (max consumed offset + 1) for each partition.
-func extractOffsets(batch []map[string]interface{}) (map[int32]int64, error) {
-	offsets := make(map[int32]int64)
-	for i, record := range batch {
-		partition, err := partitionFromRecord(record["kafka_partition"])
-		if err != nil {
-			return nil, fmt.Errorf("record %d: %w", i, err)
-		}
-		offset, err := offsetFromRecord(record["kafka_offset"])
-		if err != nil {
-			return nil, fmt.Errorf("record %d: %w", i, err)
-		}
-		if current, exists := offsets[partition]; !exists || offset >= current {
-			offsets[partition] = offset + 1
-		}
-	}
-	return offsets, nil
-}
-
-func partitionFromRecord(value interface{}) (int32, error) {
-	switch v := value.(type) {
-	case int32:
-		return v, nil
-	case int64:
-		return int32(v), nil
-	case int:
-		return int32(v), nil
-	case kafka.Offset:
-		return int32(v), nil
-	default:
-		return 0, fmt.Errorf("invalid kafka_partition type %T", value)
-	}
-}
-
-func offsetFromRecord(value interface{}) (int64, error) {
-	switch v := value.(type) {
-	case int64:
-		return v, nil
-	case int32:
-		return int64(v), nil
-	case int:
-		return int64(v), nil
-	case kafka.Offset:
-		return int64(v), nil
-	default:
-		return 0, fmt.Errorf("invalid kafka_offset type %T", value)
-	}
 }
