@@ -27,7 +27,7 @@ graph LR
     classDef clickhouse fill:#f5c542,stroke:#c49a1a,color:#333
 ```
 
-Each topic gets its own sink task running a single loop: read a message, decode it, append it to a batch, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task -- the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying.
+Each topic gets its own sink task running a single loop: read a message, decode it, append it to a batch, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task, the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying.
 
 Delivery is **at-least-once**. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered. Deduplication is your responsibility (e.g. `ReplacingMergeTree` with an application-level key).
 
