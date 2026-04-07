@@ -2,18 +2,54 @@
 
 A lightweight Go service that sinks Kafka topics into ClickHouse tables. Each topic gets its own consumer and independent batch pipeline.
 
-## Architecture
+```mermaid
+graph LR
+    subgraph Kafka
+        T1[Topic A]
+        T2[Topic B]
+        T3[Topic N]
+    end
 
+    subgraph "Sink Task A — isolated"
+        C1[Consumer A] --> D1[Decoder] --> B1[Batch Buffer]
+    end
+
+    subgraph "Sink Task B — isolated"
+        C2[Consumer B] --> D2[Decoder] --> B2[Batch Buffer]
+    end
+
+    subgraph "Sink Task N — isolated"
+        C3[Consumer N] --> D3[Decoder] --> B3[Batch Buffer]
+    end
+
+    subgraph ClickHouse
+        CH1[(Table A)]
+        CH2[(Table B)]
+        CH3[(Table N)]
+    end
+
+    subgraph DLQ
+        DLQ1[Topic A.dlq]
+        DLQ2[Topic B.dlq]
+        DLQ3[Topic N.dlq]
+    end
+
+    T1 --> C1
+    T2 --> C2
+    T3 --> C3
+
+    B1 -- flush --> CH1
+    B2 -- flush --> CH2
+    B3 -- flush --> CH3
+
+    B1 -. "write failure<br/>after retries" .-> DLQ1
+    B2 -. "write failure<br/>after retries" .-> DLQ2
+    B3 -. "write failure<br/>after retries" .-> DLQ3
 ```
-Kafka topic A ──> consumer A ──> batch buffer A ──> ClickHouse table A
-Kafka topic B ──> consumer B ──> batch buffer B ──> ClickHouse table B
-                                       │
-                                       └──> DLQ topic (on failure)
-```
 
-Each sink task runs two goroutines: a **consumer loop** that reads and decodes messages, and a **batch processor** that accumulates records and flushes them to ClickHouse when a size or time threshold is reached. On write failure, retries with exponential backoff are attempted before forwarding to a Dead Letter Queue.
+Each sink task runs two goroutines: a **consumer loop** that reads and decodes messages, and a **batch processor** that accumulates records and flushes them to ClickHouse when a size or time threshold is reached. On write failure, retries with exponential backoff are attempted before forwarding to a Dead Letter Queue. Decode errors (bad data, schema mismatch) **stop the task** by default -- use [repair mode](#repair-mode) to route them to the DLQ instead.
 
-**Topic isolation**: each topic runs independently. A failure in one topic (bad data, schema change, ClickHouse error) stops only that topic -- the other 199 keep running. Stopped topics can be restarted via the admin API without redeploying.
+**Topic isolation**: each topic runs independently with its own consumer, decoder, and batch buffer. A failure in one topic (bad data, schema change, ClickHouse error) stops only that task -- the others keep running. Stopped topics can be restarted via the admin API without redeploying.
 
 ### Delivery semantics
 
