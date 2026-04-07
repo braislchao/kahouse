@@ -34,7 +34,7 @@ graph LR
     classDef clickhouse fill:#f5c542,stroke:#c49a1a,color:#333
 ```
 
-Each sink task runs two goroutines: a **consumer loop** that reads and decodes messages, and a **batch processor** that accumulates records and flushes them to ClickHouse when a size or time threshold is reached. Write failures are retried with exponential backoff; if all retries are exhausted the task stops. Decode errors (bad data, schema mismatch) also **stop the task** by default -- use [repair mode](#repair-mode) to route them to the DLQ instead.
+Each sink task runs a single loop: read a message, decode it, add it to the batch buffer, and flush to ClickHouse when a size or time threshold is reached. Write failures are retried with exponential backoff; if all retries are exhausted the task stops. Decode errors (bad data, schema mismatch) also **stop the task** by default -- use [repair mode](#repair-mode) to route them to the DLQ instead.
 
 **Topic isolation**: each topic runs independently with its own consumer, decoder, and batch buffer. A failure in one topic (bad data, schema change, ClickHouse error) stops only that task -- the others keep running. Stopped topics can be restarted via the admin API without redeploying.
 
@@ -48,23 +48,20 @@ kahouse provides **at-least-once** delivery. Offsets are committed only after a 
 # Build
 go build -o kahouse ./cmd/kahouse
 
-# Run (with config file or env vars)
-./kahouse
+# Run with a config file
+./kahouse -config kahouse.yaml
 ```
 
 Or with Docker:
 
 ```bash
 docker build -t kahouse .
-docker run -e KAHOUSE_KAFKA_BROKERS=kafka:9092 \
-           -e KAHOUSE_CLICKHOUSE_DSN=tcp://clickhouse:9000 \
-           -e KAHOUSE_TOPIC_TABLES='[{"topic":"orders","table":"default.orders"}]' \
-           kahouse
+docker run -v $(pwd)/kahouse.yaml:/etc/kahouse/kahouse.yaml kahouse
 ```
 
 ## Configuration
 
-Copy `config.yaml.example` to `kahouse.yaml` and edit. Environment variables with the `KAHOUSE_` prefix override file values (e.g. `KAHOUSE_KAFKA_BROKERS`).
+Create a YAML config file and pass it with `-config <path>` or the `KAHOUSE_CONFIG` environment variable. Defaults to `kahouse.yaml` in the working directory.
 
 ```yaml
 kafka_brokers: "localhost:9092"
@@ -101,23 +98,6 @@ Each topic can override `format`, `string_value_column`, `batch_size`, `batch_de
 | `avro` | Confluent wire-format Avro. Schemas are fetched and cached from Schema Registry. | Yes |
 | `json` | Single JSON object per message. Integers decode as `Int64`, decimals as `Float64`. | No |
 | `string` | Raw message value stored in a single column (configured via `string_value_column`). | No |
-
-### Config file search order
-
-1. `./kahouse.yaml`
-2. `./config.yaml`
-3. `$HOME/kahouse.yaml`
-4. `$HOME/config.yaml`
-5. `/etc/kahouse/kahouse.yaml`
-6. `/etc/kahouse/config.yaml`
-
-### `KAHOUSE_TOPIC_TABLES` environment variable
-
-Topic mappings can be provided as a JSON array via environment variable, useful for container deployments:
-
-```bash
-export KAHOUSE_TOPIC_TABLES='[{"topic":"orders","table":"default.orders","format":"json"}]'
-```
 
 ## ClickHouse table requirements
 

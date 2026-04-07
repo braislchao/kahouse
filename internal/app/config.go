@@ -1,63 +1,62 @@
 package app
 
 import (
-	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/spf13/viper"
+	"go.yaml.in/yaml/v3"
 )
 
 // TopicTableMapping defines a single topic-to-table mapping with optional per-topic overrides.
 // Numeric fields are pointers so that nil ("not set") can be distinguished from an explicit zero.
 // A nil field inherits the global default; a non-nil field (including *0) is used as-is.
 type TopicTableMapping struct {
-	Topic             string `mapstructure:"topic" json:"topic"`
-	Table             string `mapstructure:"table" json:"table"`
-	Format            string `mapstructure:"format" json:"format,omitempty"`
-	StringValueColumn string `mapstructure:"string_value_column" json:"string_value_column,omitempty"`
-	BatchSize         *int   `mapstructure:"batch_size" json:"batch_size,omitempty"`
-	BatchDelayMs      *int   `mapstructure:"batch_delay_ms" json:"batch_delay_ms,omitempty"`
-	MaxRetries        *int   `mapstructure:"max_retries" json:"max_retries,omitempty"`
-	RetryBackoffMs    *int   `mapstructure:"retry_backoff_ms" json:"retry_backoff_ms,omitempty"`
+	Topic             string `yaml:"topic"`
+	Table             string `yaml:"table"`
+	Format            string `yaml:"format,omitempty"`
+	StringValueColumn string `yaml:"string_value_column,omitempty"`
+	BatchSize         *int   `yaml:"batch_size,omitempty"`
+	BatchDelayMs      *int   `yaml:"batch_delay_ms,omitempty"`
+	MaxRetries        *int   `yaml:"max_retries,omitempty"`
+	RetryBackoffMs    *int   `yaml:"retry_backoff_ms,omitempty"`
 }
 
 // Config holds all configuration for the application.
 type Config struct {
-	KafkaBrokers   string `mapstructure:"kafka_brokers"`
-	SchemaRegistry string `mapstructure:"schema_registry"`
-	ClickHouseDSN  string `mapstructure:"clickhouse_dsn"`
-	GroupID        string `mapstructure:"group_id"`
-	DLQTopicSuffix string `mapstructure:"dlq_topic_suffix"`
-	InputFormat    string `mapstructure:"input_format"`
+	KafkaBrokers   string `yaml:"kafka_brokers"`
+	SchemaRegistry string `yaml:"schema_registry"`
+	ClickHouseDSN  string `yaml:"clickhouse_dsn"`
+	GroupID        string `yaml:"group_id"`
+	DLQTopicSuffix string `yaml:"dlq_topic_suffix"`
+	InputFormat    string `yaml:"input_format"`
 
 	// String input settings.
-	StringValueColumn string `mapstructure:"string_value_column"`
+	StringValueColumn string `yaml:"string_value_column"`
 
 	// Schema Registry authentication (optional — omit for unauthenticated registries)
-	SchemaRegistryUsername string `mapstructure:"schema_registry_username"`
-	SchemaRegistryPassword string `mapstructure:"schema_registry_password"`
+	SchemaRegistryUsername string `yaml:"schema_registry_username"`
+	SchemaRegistryPassword string `yaml:"schema_registry_password"`
 
 	// Kafka authentication (all optional — omit for unauthenticated clusters)
-	KafkaSecurityProtocol string `mapstructure:"kafka_security_protocol"`
-	KafkaSASLMechanism    string `mapstructure:"kafka_sasl_mechanism"`
-	KafkaSASLUsername     string `mapstructure:"kafka_sasl_username"`
-	KafkaSASLPassword     string `mapstructure:"kafka_sasl_password"`
-	KafkaSSLCALocation    string `mapstructure:"kafka_ssl_ca_location"`
+	KafkaSecurityProtocol string `yaml:"kafka_security_protocol"`
+	KafkaSASLMechanism    string `yaml:"kafka_sasl_mechanism"`
+	KafkaSASLUsername     string `yaml:"kafka_sasl_username"`
+	KafkaSASLPassword     string `yaml:"kafka_sasl_password"`
+	KafkaSSLCALocation    string `yaml:"kafka_ssl_ca_location"`
 
 	// Server settings
-	MetricsPort int `mapstructure:"metrics_port"`
+	MetricsPort int `yaml:"metrics_port"`
 
 	// Batch defaults (overridable per topic)
-	BatchSize      int `mapstructure:"batch_size"`
-	BatchDelayMs   int `mapstructure:"batch_delay_ms"`
-	MaxRetries     int `mapstructure:"max_retries"`
-	RetryBackoffMs int `mapstructure:"retry_backoff_ms"`
+	BatchSize      int `yaml:"batch_size"`
+	BatchDelayMs   int `yaml:"batch_delay_ms"`
+	MaxRetries     int `yaml:"max_retries"`
+	RetryBackoffMs int `yaml:"retry_backoff_ms"`
 
-	TopicTables []TopicTableMapping `mapstructure:"topic_tables"`
+	TopicTables []TopicTableMapping `yaml:"topic_tables"`
 }
 
 // intPtr returns a pointer to a copy of v.
@@ -88,57 +87,74 @@ func (m *TopicTableMapping) resolve(cfg *Config) {
 	}
 }
 
-// defaults holds the default configuration values.
-// topic_tables has no default entry — an explicit mapping is required.
-var defaults = map[string]interface{}{
-	"kafka_brokers":            "localhost:9092",
-	"schema_registry":          "http://localhost:8081",
-	"schema_registry_username": "",
-	"schema_registry_password": "",
-	"clickhouse_dsn":           "tcp://localhost:9000",
-	"group_id":                 "kahouse",
-	"batch_size":               10000,
-	"batch_delay_ms":           200,
-	"max_retries":              5,
-	"retry_backoff_ms":         100,
-	"metrics_port":             9090,
-	"dlq_topic_suffix":         ".dlq",
-	"input_format":             "avro",
-	"string_value_column":      "value",
-	"kafka_security_protocol":  "",
-	"kafka_sasl_mechanism":     "",
-	"kafka_sasl_username":      "",
-	"kafka_sasl_password":      "",
-	"kafka_ssl_ca_location":    "",
+func applyDefaults(cfg *Config) {
+	if cfg.KafkaBrokers == "" {
+		cfg.KafkaBrokers = "localhost:9092"
+	}
+	if cfg.SchemaRegistry == "" {
+		cfg.SchemaRegistry = "http://localhost:8081"
+	}
+	if cfg.ClickHouseDSN == "" {
+		cfg.ClickHouseDSN = "tcp://localhost:9000"
+	}
+	if cfg.GroupID == "" {
+		cfg.GroupID = "kahouse"
+	}
+	if cfg.DLQTopicSuffix == "" {
+		cfg.DLQTopicSuffix = ".dlq"
+	}
+	if cfg.InputFormat == "" {
+		cfg.InputFormat = "avro"
+	}
+	if cfg.StringValueColumn == "" {
+		cfg.StringValueColumn = "value"
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = 10000
+	}
+	if cfg.BatchDelayMs == 0 {
+		cfg.BatchDelayMs = 200
+	}
+	if cfg.MaxRetries == 0 {
+		cfg.MaxRetries = 5
+	}
+	if cfg.RetryBackoffMs == 0 {
+		cfg.RetryBackoffMs = 100
+	}
+	if cfg.MetricsPort == 0 {
+		cfg.MetricsPort = 9090
+	}
+}
+
+// configPath returns the config file path from -config flag or KAHOUSE_CONFIG env var.
+// Defaults to "kahouse.yaml".
+func configPath() string {
+	path := flag.String("config", "", "path to config file (default: kahouse.yaml or KAHOUSE_CONFIG)")
+	flag.Parse()
+
+	if *path != "" {
+		return *path
+	}
+	if env := os.Getenv("KAHOUSE_CONFIG"); env != "" {
+		return env
+	}
+	return "kahouse.yaml"
 }
 
 func loadConfig() (*Config, error) {
-	v := viper.New()
+	path := configPath()
 
-	for key, value := range defaults {
-		v.SetDefault(key, value)
-	}
-
-	v.SetEnvPrefix("kahouse")
-	v.AutomaticEnv()
-
-	if err := readConfigFile(v); err != nil {
-		return nil, err
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file %q: %w", path, err)
 	}
 
 	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("unable to decode config into struct: %w", err)
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config file %q: %w", path, err)
 	}
 
-	topicTables, ok, err := topicTablesFromEnv()
-	if err != nil {
-		return nil, err
-	}
-	if ok {
-		cfg.TopicTables = topicTables
-	}
-
+	applyDefaults(&cfg)
 	cfg.InputFormat = normalizeInputFormat(cfg.InputFormat)
 	cfg.StringValueColumn = strings.TrimSpace(cfg.StringValueColumn)
 
@@ -146,73 +162,11 @@ func loadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	// Resolve per-topic defaults
 	for i := range cfg.TopicTables {
 		cfg.TopicTables[i].resolve(&cfg)
 	}
 
 	return &cfg, nil
-}
-
-func topicTablesFromEnv() ([]TopicTableMapping, bool, error) {
-	rawTopicTables := strings.TrimSpace(os.Getenv("KAHOUSE_TOPIC_TABLES"))
-	if rawTopicTables == "" {
-		return nil, false, nil
-	}
-
-	var topicTables []TopicTableMapping
-	if err := json.Unmarshal([]byte(rawTopicTables), &topicTables); err != nil {
-		return nil, false, fmt.Errorf("failed to parse KAHOUSE_TOPIC_TABLES as JSON: %w", err)
-	}
-	return topicTables, true, nil
-}
-
-func readConfigFile(v *viper.Viper) error {
-	configFile, err := findConfigFile(configSearchPaths())
-	if err != nil {
-		return err
-	}
-	if configFile == "" {
-		return nil
-	}
-
-	v.SetConfigFile(configFile)
-	if err := v.ReadInConfig(); err != nil {
-		return fmt.Errorf("config file %q could not be parsed: %w", configFile, err)
-	}
-	return nil
-}
-
-func configSearchPaths() []string {
-	dirs := []string{"."}
-	if homeDir, err := os.UserHomeDir(); err == nil && strings.TrimSpace(homeDir) != "" {
-		dirs = append(dirs, homeDir)
-	}
-	dirs = append(dirs, "/etc/kahouse")
-
-	var paths []string
-	for _, dir := range dirs {
-		for _, name := range []string{"kahouse.yaml", "config.yaml"} {
-			paths = append(paths, filepath.Join(dir, name))
-		}
-	}
-	return paths
-}
-
-func findConfigFile(paths []string) (string, error) {
-	for _, path := range paths {
-		info, err := os.Stat(path)
-		if err == nil {
-			if info.IsDir() {
-				continue
-			}
-			return path, nil
-		}
-		if !os.IsNotExist(err) {
-			return "", fmt.Errorf("failed to inspect config file %q: %w", path, err)
-		}
-	}
-	return "", nil
 }
 
 func validateConfig(cfg *Config) error {
@@ -255,7 +209,7 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("retry_backoff_ms must be >= 0, got %d", cfg.RetryBackoffMs)
 	}
 	if len(cfg.TopicTables) == 0 {
-		return fmt.Errorf("at least one topic_table mapping is required (set topic_tables in config file or KAHOUSE_TOPIC_TABLES env var)")
+		return fmt.Errorf("at least one topic_tables mapping is required")
 	}
 	seenTopics := make(map[string]int, len(cfg.TopicTables))
 	for i, tt := range cfg.TopicTables {

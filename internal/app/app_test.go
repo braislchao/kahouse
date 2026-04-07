@@ -8,13 +8,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
@@ -238,48 +235,6 @@ func TestValidateConfigRejectsDuplicateTopics(t *testing.T) {
 	}
 }
 
-func TestFindConfigFileReturnsFirstExistingPath(t *testing.T) {
-	dir := t.TempDir()
-	serviceConfig := filepath.Join(dir, "kahouse.yaml")
-	legacyConfig := filepath.Join(dir, "config.yaml")
-
-	if err := os.WriteFile(serviceConfig, []byte("topic_tables: []\n"), 0o600); err != nil {
-		t.Fatalf("Failed to write service config: %v", err)
-	}
-	if err := os.WriteFile(legacyConfig, []byte("topic_tables: []\n"), 0o600); err != nil {
-		t.Fatalf("Failed to write legacy config: %v", err)
-	}
-
-	path, err := findConfigFile([]string{legacyConfig, serviceConfig})
-	if err != nil {
-		t.Fatalf("Expected no error finding config file, got %v", err)
-	}
-	if path != legacyConfig {
-		t.Fatalf("Expected first existing config file to be selected, got %q", path)
-	}
-
-	path, err = findConfigFile([]string{serviceConfig, legacyConfig})
-	if err != nil {
-		t.Fatalf("Expected no error finding config file, got %v", err)
-	}
-	if path != serviceConfig {
-		t.Fatalf("Expected service config to win when searched first, got %q", path)
-	}
-}
-
-func TestConfigSearchPathsOrdersServiceConfigBeforeLegacy(t *testing.T) {
-	paths := configSearchPaths()
-	if len(paths) < 2 {
-		t.Fatalf("Expected at least two config search paths, got %v", paths)
-	}
-	if !strings.HasSuffix(paths[0], "kahouse.yaml") {
-		t.Fatalf("Expected first config path to use service filename, got %q", paths[0])
-	}
-	if !strings.HasSuffix(paths[1], "config.yaml") {
-		t.Fatalf("Expected second config path to use legacy filename, got %q", paths[1])
-	}
-}
-
 func TestConfigLogFieldsRedactsSecrets(t *testing.T) {
 	fields := configLogFields(&Config{
 		KafkaBrokers:      "localhost:9092",
@@ -306,27 +261,6 @@ func TestConfigLogFieldsRedactsSecrets(t *testing.T) {
 	}
 	if got := fieldMap["clickhouse_dsn"]; got != "tcp://[redacted]@clickhouse:9000?debug=true" {
 		t.Fatalf("Expected redacted DSN, got %v", got)
-	}
-}
-
-func TestTopicTablesFromEnvParsesJSON(t *testing.T) {
-	t.Setenv("KAHOUSE_TOPIC_TABLES", `[{"topic":"orders","table":"default.orders","max_retries":0}]`)
-
-	topicTables, ok, err := topicTablesFromEnv()
-	if err != nil {
-		t.Fatalf("Expected topicTablesFromEnv to parse JSON, got %v", err)
-	}
-	if !ok {
-		t.Fatal("Expected topicTablesFromEnv to return ok=true")
-	}
-	if len(topicTables) != 1 {
-		t.Fatalf("Expected 1 topic mapping, got %d", len(topicTables))
-	}
-	if topicTables[0].Topic != "orders" || topicTables[0].Table != "default.orders" {
-		t.Fatalf("Unexpected topic mapping: %+v", topicTables[0])
-	}
-	if topicTables[0].MaxRetries == nil || *topicTables[0].MaxRetries != 0 {
-		t.Fatalf("Expected explicit max_retries override of 0, got %+v", topicTables[0].MaxRetries)
 	}
 }
 
@@ -621,32 +555,6 @@ func TestNewMessageDecoderUsesExplicitFormat(t *testing.T) {
 
 	if _, err := newMessageDecoder("avro", "", nil); err == nil {
 		t.Fatal("Expected avro decoder creation without schema registry client to fail")
-	}
-}
-
-func TestViperEnvSupportsInputFormatFields(t *testing.T) {
-	t.Setenv("KAHOUSE_INPUT_FORMAT", "STRING")
-	t.Setenv("KAHOUSE_STRING_VALUE_COLUMN", "value")
-
-	v := viper.New()
-	for key, value := range defaults {
-		v.SetDefault(key, value)
-	}
-	v.SetEnvPrefix("kahouse")
-	v.AutomaticEnv()
-
-	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
-		t.Fatalf("Expected config to unmarshal, got %v", err)
-	}
-	cfg.InputFormat = normalizeInputFormat(cfg.InputFormat)
-	cfg.StringValueColumn = strings.TrimSpace(cfg.StringValueColumn)
-
-	if cfg.InputFormat != "string" {
-		t.Fatalf("Expected input format string, got %q", cfg.InputFormat)
-	}
-	if cfg.StringValueColumn != "value" {
-		t.Fatalf("Expected string_value_column value, got %q", cfg.StringValueColumn)
 	}
 }
 
