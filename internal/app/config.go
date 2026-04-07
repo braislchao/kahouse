@@ -40,6 +40,9 @@ type Config struct {
 	SchemaRegistryUsername string `yaml:"schema_registry_username"`
 	SchemaRegistryPassword string `yaml:"schema_registry_password"`
 
+	// Consumer offset reset policy
+	AutoOffsetReset string `mapstructure:"auto_offset_reset"`
+
 	// Kafka authentication (all optional — omit for unauthenticated clusters)
 	KafkaSecurityProtocol string `yaml:"kafka_security_protocol"`
 	KafkaSASLMechanism    string `yaml:"kafka_sasl_mechanism"`
@@ -49,6 +52,18 @@ type Config struct {
 
 	// Server settings
 	MetricsPort int `yaml:"metrics_port"`
+
+	// ClickHouse connection pool
+	ClickHouseMaxOpenConns int `mapstructure:"clickhouse_max_open_conns"`
+	ClickHouseMaxIdleConns int `mapstructure:"clickhouse_max_idle_conns"`
+
+	// ClickHouse async insert settings
+	ClickHouseAsyncInsert        bool `mapstructure:"clickhouse_async_insert"`
+	ClickHouseWaitForAsyncInsert bool `mapstructure:"clickhouse_wait_for_async_insert"`
+
+	// Kafka consumer timeout settings
+	KafkaSessionTimeoutMs  int `mapstructure:"kafka_session_timeout_ms"`
+	KafkaMaxPollIntervalMs int `mapstructure:"kafka_max_poll_interval_ms"`
 
 	// Batch defaults (overridable per topic)
 	BatchSize      int  `yaml:"batch_size"`
@@ -109,6 +124,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.StringValueColumn == "" {
 		cfg.StringValueColumn = "value"
 	}
+	if cfg.AutoOffsetReset == "" {
+		cfg.AutoOffsetReset = "earliest"
+	}
 	if cfg.BatchSize == 0 {
 		cfg.BatchSize = 10000
 	}
@@ -123,6 +141,20 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.MetricsPort == 0 {
 		cfg.MetricsPort = 9090
+	}
+	if cfg.ClickHouseMaxOpenConns == 0 {
+		cfg.ClickHouseMaxOpenConns = 5
+	}
+	if cfg.ClickHouseMaxIdleConns == 0 {
+		cfg.ClickHouseMaxIdleConns = 5
+	}
+	// ClickHouseAsyncInsert and ClickHouseWaitForAsyncInsert default to false (zero value for bool).
+	// This is intentional: async inserts are opt-in.
+	if cfg.KafkaSessionTimeoutMs == 0 {
+		cfg.KafkaSessionTimeoutMs = 45000
+	}
+	if cfg.KafkaMaxPollIntervalMs == 0 {
+		cfg.KafkaMaxPollIntervalMs = 300000
 	}
 }
 
@@ -175,6 +207,12 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("input_format must be one of avro, json, or string, got %q", cfg.InputFormat)
 	}
 
+	switch cfg.AutoOffsetReset {
+	case "earliest", "latest", "none":
+	default:
+		return fmt.Errorf("auto_offset_reset must be one of earliest, latest, or none, got %q", cfg.AutoOffsetReset)
+	}
+
 	if strings.TrimSpace(cfg.KafkaBrokers) == "" {
 		return fmt.Errorf("kafka_brokers is required")
 	}
@@ -193,6 +231,12 @@ func validateConfig(cfg *Config) error {
 	if cfg.InputFormat == "string" && cfg.StringValueColumn == "" {
 		return fmt.Errorf("string_value_column is required when input_format is string")
 	}
+	if cfg.ClickHouseMaxOpenConns < 1 {
+		return fmt.Errorf("clickhouse_max_open_conns must be at least 1, got %d", cfg.ClickHouseMaxOpenConns)
+	}
+	if cfg.ClickHouseMaxIdleConns < 1 {
+		return fmt.Errorf("clickhouse_max_idle_conns must be at least 1, got %d", cfg.ClickHouseMaxIdleConns)
+	}
 	if cfg.BatchSize < 1 {
 		return fmt.Errorf("batch_size must be at least 1, got %d", cfg.BatchSize)
 	}
@@ -204,6 +248,12 @@ func validateConfig(cfg *Config) error {
 	}
 	if *cfg.RetryBackoffMs < 0 {
 		return fmt.Errorf("retry_backoff_ms must be >= 0, got %d", *cfg.RetryBackoffMs)
+	}
+	if cfg.KafkaSessionTimeoutMs <= 0 {
+		return fmt.Errorf("kafka_session_timeout_ms must be > 0, got %d", cfg.KafkaSessionTimeoutMs)
+	}
+	if cfg.KafkaMaxPollIntervalMs <= 0 {
+		return fmt.Errorf("kafka_max_poll_interval_ms must be > 0, got %d", cfg.KafkaMaxPollIntervalMs)
 	}
 	if len(cfg.TopicTables) == 0 {
 		return fmt.Errorf("at least one topic_tables mapping is required")
@@ -253,10 +303,15 @@ func configLogFields(cfg *Config) []interface{} {
 		"schema_registry_username", cfg.SchemaRegistryUsername,
 		"schema_registry_password", redactSecret(cfg.SchemaRegistryPassword),
 		"clickhouse_dsn", redactDSN(cfg.ClickHouseDSN),
+		"clickhouse_max_open_conns", cfg.ClickHouseMaxOpenConns,
+		"clickhouse_max_idle_conns", cfg.ClickHouseMaxIdleConns,
+		"clickhouse_async_insert", cfg.ClickHouseAsyncInsert,
+		"clickhouse_wait_for_async_insert", cfg.ClickHouseWaitForAsyncInsert,
 		"group_id", cfg.GroupID,
 		"dlq_topic_suffix", cfg.DLQTopicSuffix,
 		"input_format", cfg.InputFormat,
 		"string_value_column", cfg.StringValueColumn,
+		"auto_offset_reset", cfg.AutoOffsetReset,
 		"kafka_security_protocol", cfg.KafkaSecurityProtocol,
 		"kafka_sasl_mechanism", cfg.KafkaSASLMechanism,
 		"kafka_sasl_username", cfg.KafkaSASLUsername,
@@ -266,6 +321,8 @@ func configLogFields(cfg *Config) []interface{} {
 		"batch_delay_ms", *cfg.BatchDelayMs,
 		"max_retries", *cfg.MaxRetries,
 		"retry_backoff_ms", *cfg.RetryBackoffMs,
+		"kafka_session_timeout_ms", cfg.KafkaSessionTimeoutMs,
+		"kafka_max_poll_interval_ms", cfg.KafkaMaxPollIntervalMs,
 		"topic_tables", cfg.TopicTables,
 	}
 }

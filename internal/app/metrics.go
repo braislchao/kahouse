@@ -1,6 +1,9 @@
 package app
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
 
 // All metrics are namespaced under "kahouse" to avoid collisions with other applications.
 var (
@@ -57,6 +60,11 @@ var (
 		Namespace: "kahouse",
 		Name:      "task_restarts_total",
 		Help:      "Total number of times a sink task has been restarted via the admin API",
+	}, []string{"topic"})
+	msgChannelDepth = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "kahouse",
+		Name:      "msg_channel_depth",
+		Help:      "Current number of messages buffered in the internal channel between consumer and batch processor.",
 	}, []string{"topic"})
 )
 
