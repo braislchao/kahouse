@@ -82,37 +82,6 @@ topic_tables:
 
 See `config.yaml.example` for a full annotated example.
 
-### Input formats
-
-| Format | Description | Schema Registry required |
-|--------|-------------|--------------------------|
-| `avro` | Confluent wire-format Avro. Schemas are fetched and cached from Schema Registry. | Yes |
-| `json` | Single JSON object per message. Integers decode as `Int64`, decimals as `Float64`. | No |
-| `string` | Raw message value stored in a single column (configured via `string_value_column`). | No |
-
-### Per-topic overrides
-
-Each topic can override `format`, `string_value_column`, `batch_size`, `batch_delay_ms`, `max_retries`, and `retry_backoff_ms`. Omit a field to inherit the global default.
-
-### Kafka authentication
-
-SASL and TLS are supported. All auth fields are optional.
-
-```yaml
-kafka_security_protocol: "SASL_SSL"
-kafka_sasl_mechanism: "PLAIN"
-kafka_sasl_username: "your-api-key"
-kafka_sasl_password: "your-api-secret"
-kafka_ssl_ca_location: "/path/to/ca.crt"     # only for custom CAs
-```
-
-Schema Registry authentication:
-
-```yaml
-schema_registry_username: "your-sr-api-key"
-schema_registry_password: "your-sr-api-secret"
-```
-
 ## ClickHouse
 
 Table columns must match the fields in the decoded messages.
