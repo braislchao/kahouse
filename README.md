@@ -10,13 +10,8 @@ graph LR
     end
 
     subgraph kahouse
-        direction LR
-        subgraph "Sink Task A"
-            C1[Consumer]:::pipeline --> D1[Decoder]:::pipeline --> B1[Batch Buffer]:::pipeline
-        end
-        subgraph "Sink Task B"
-            C2[Consumer]:::pipeline --> D2[Decoder]:::pipeline --> B2[Batch Buffer]:::pipeline
-        end
+        S1[Sink Task]:::pipeline
+        S2[Sink Task]:::pipeline
     end
 
     subgraph ClickHouse
@@ -24,17 +19,15 @@ graph LR
         CH2[(payments)]:::clickhouse
     end
 
-    T1 --> C1
-    T2 --> C2
-    B1 --> CH1
-    B2 --> CH2
+    T1 --> S1 --> CH1
+    T2 --> S2 --> CH2
 
     classDef kafka fill:#ff6b35,stroke:#c44d1a,color:#fff
     classDef pipeline fill:#4a90d9,stroke:#2c6fad,color:#fff
     classDef clickhouse fill:#f5c542,stroke:#c49a1a,color:#333
 ```
 
-Each topic gets its own sink task with an independent consumer, decoder, and batch buffer. A sink task runs a single loop: read a message, decode it, buffer it, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task, the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying. Consumer group separation ensures full offset isolation between topics.
+Each topic gets its own sink task running a single loop: read a message, decode it, append it to a batch, and flush to ClickHouse when a size or time threshold is reached. A failure in one topic stops only that task -- the others keep running. Stopped topics can be restarted via the [admin API](#admin-api) without redeploying.
 
 Delivery is **at-least-once**. Offsets are committed only after a batch is successfully written to ClickHouse. On restart, some records may be re-delivered. Deduplication is your responsibility (e.g. `ReplacingMergeTree` with an application-level key).
 
