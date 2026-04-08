@@ -262,9 +262,10 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 	defer flushCancel()
 
 	writeStart := time.Now()
-	attempts, writeErr := t.writeWithRetries(flushCtx, table, batch)
+	attempts, timing, writeErr := t.writeWithRetries(flushCtx, table, batch)
+	writeDuration := time.Since(writeStart)
 
-	processLatency.WithLabelValues(topic).Observe(time.Since(writeStart).Seconds())
+	processLatency.WithLabelValues(topic).Observe(writeDuration.Seconds())
 	batchSizeHist.WithLabelValues(topic).Observe(float64(len(batch)))
 	batchDelayHist.WithLabelValues(topic).Observe(time.Since(firstInBatch).Seconds())
 	retryCountHist.WithLabelValues(topic).Observe(float64(attempts))
@@ -276,6 +277,9 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 			"batch_size", len(batch),
 			"attempts", attempts,
 			"flush_duration_ms", time.Since(flushStart).Milliseconds(),
+			"prepare_ms", timing.Prepare.Milliseconds(),
+			"append_ms", timing.Append.Milliseconds(),
+			"send_ms", timing.Send.Milliseconds(),
 		)
 		return false
 	}
@@ -284,22 +288,45 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 
 	// Commit the consumer's current position. Since no read-ahead happens,
 	// this commits exactly the offsets of the messages in this batch.
-	if _, err := t.consumer.Commit(); err != nil {
-		t.sugar.Errorf("Failed to commit offsets: %v", err)
-		return false
+	// If the commit fails (e.g. after a rebalance clears stored offsets),
+	// we log a warning but do NOT stop the task: the data was already written
+	// to ClickHouse, and the consumer will keep reading from its current
+	// position. Stopping would guarantee duplicate inserts on restart.
+	commitStart := time.Now()
+	_, commitErr := t.consumer.Commit()
+	commitDuration := time.Since(commitStart)
+
+	if commitErr != nil {
+		t.sugar.Warnw("Offset commit failed, data already written to ClickHouse; continuing",
+			"error", commitErr,
+			"batch_size", len(batch),
+			"flush_duration_ms", time.Since(flushStart).Milliseconds(),
+			"write_ms", writeDuration.Milliseconds(),
+			"prepare_ms", timing.Prepare.Milliseconds(),
+			"append_ms", timing.Append.Milliseconds(),
+			"send_ms", timing.Send.Milliseconds(),
+			"commit_ms", commitDuration.Milliseconds(),
+		)
+		return true
 	}
 
 	t.sugar.Infow("Batch flush completed",
 		"batch_size", len(batch),
 		"flush_duration_ms", time.Since(flushStart).Milliseconds(),
+		"write_ms", writeDuration.Milliseconds(),
+		"prepare_ms", timing.Prepare.Milliseconds(),
+		"append_ms", timing.Append.Milliseconds(),
+		"send_ms", timing.Send.Milliseconds(),
+		"commit_ms", commitDuration.Milliseconds(),
 	)
 	return true
 }
 
 // writeWithRetries attempts to write the batch, retrying with exponential backoff+jitter.
-// Returns the number of attempts made and the final error (nil on success).
-func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []map[string]interface{}) (int, error) {
+// Returns the number of attempts made, the timing of the last write, and the final error (nil on success).
+func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []map[string]interface{}) (int, batchTiming, error) {
 	maxRetries := *t.mapping.MaxRetries
+	var timing batchTiming
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Duration(*t.mapping.RetryBackoffMs) * time.Millisecond
@@ -310,23 +337,25 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 			case <-timer.C:
 			case <-ctx.Done():
 				timer.Stop()
-				return attempt, ctx.Err()
+				return attempt, timing, ctx.Err()
 			}
 			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, wait)
 		}
-		if err := writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert); err != nil {
-			if !isRetriableClickHouseError(err) {
-				t.sugar.Errorf("Non-retriable ClickHouse error, skipping retries: %v", err)
-				return attempt + 1, err
+		var writeErr error
+		timing, writeErr = writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert)
+		if writeErr != nil {
+			if !isRetriableClickHouseError(writeErr) {
+				t.sugar.Errorf("Non-retriable ClickHouse error, skipping retries: %v", writeErr)
+				return attempt + 1, timing, writeErr
 			}
 			if attempt == maxRetries {
-				t.sugar.Errorf("Batch write failed on final attempt %d/%d: %v", attempt+1, maxRetries+1, err)
-				return attempt + 1, err
+				t.sugar.Errorf("Batch write failed on final attempt %d/%d: %v", attempt+1, maxRetries+1, writeErr)
+				return attempt + 1, timing, writeErr
 			}
-			t.sugar.Warnf("Batch write failed on attempt %d/%d: %v", attempt+1, maxRetries+1, err)
+			t.sugar.Warnf("Batch write failed on attempt %d/%d: %v", attempt+1, maxRetries+1, writeErr)
 			continue
 		}
-		return attempt + 1, nil
+		return attempt + 1, timing, nil
 	}
-	return 0, fmt.Errorf("writeWithRetries: no attempts made (maxRetries=%d)", maxRetries)
+	return 0, timing, fmt.Errorf("writeWithRetries: no attempts made (maxRetries=%d)", maxRetries)
 }

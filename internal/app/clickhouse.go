@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -86,10 +87,18 @@ func validateTables(ctx context.Context, chConn driver.Conn, tables []TopicTable
 	return nil
 }
 
+// batchTiming holds the duration of each phase inside writeBatch.
+type batchTiming struct {
+	Prepare time.Duration
+	Append  time.Duration
+	Send    time.Duration
+}
+
 // writeBatch writes a batch of records to a ClickHouse table.
-func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool) error {
+func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool) (batchTiming, error) {
+	var timing batchTiming
 	if len(batch) == 0 {
-		return nil
+		return timing, nil
 	}
 
 	// Collect the union of all column names across the batch to handle sparse JSON
@@ -122,28 +131,37 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 	}
 	quotedTable, err := quoteTableIdentifier(table)
 	if err != nil {
-		return fmt.Errorf("invalid table name: %w", err)
+		return timing, fmt.Errorf("invalid table name: %w", err)
 	}
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES", quotedTable, strings.Join(quoted, ", "))
+
+	prepareStart := time.Now()
 	batchStmt, err := chConn.PrepareBatch(ctx, insertSQL)
+	timing.Prepare = time.Since(prepareStart)
 	if err != nil {
-		return fmt.Errorf("failed to prepare batch insert: %w", err)
+		return timing, fmt.Errorf("failed to prepare batch insert: %w", err)
 	}
 
 	// Append expects all column values for a single row in one variadic call.
+	appendStart := time.Now()
 	for _, record := range batch {
 		row := make([]interface{}, len(columns))
 		for i, col := range columns {
 			row[i] = record[col]
 		}
 		if err := batchStmt.Append(row...); err != nil {
-			return fmt.Errorf("failed to append row to batch: %w", err)
+			timing.Append = time.Since(appendStart)
+			return timing, fmt.Errorf("failed to append row to batch: %w", err)
 		}
 	}
+	timing.Append = time.Since(appendStart)
 
+	sendStart := time.Now()
 	if err := batchStmt.Send(); err != nil {
-		return fmt.Errorf("failed to send batch insert: %w", err)
+		timing.Send = time.Since(sendStart)
+		return timing, fmt.Errorf("failed to send batch insert: %w", err)
 	}
+	timing.Send = time.Since(sendStart)
 
-	return nil
+	return timing, nil
 }
