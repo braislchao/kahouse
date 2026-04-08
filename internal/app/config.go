@@ -3,6 +3,7 @@ package app
 import (
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -345,6 +346,41 @@ func redactSecret(value string) string {
 		return ""
 	}
 	return "[redacted]"
+}
+
+// sanitizeDSN percent-encodes the user and password portions of a DSN so that
+// special characters (?, @, #, etc.) in credentials don't break url.Parse.
+// It locates the userinfo section between "://" and the last "@", splits on
+// the first ":" to separate user from password, and encodes both using
+// url.UserPassword which correctly escapes characters reserved in userinfo.
+func sanitizeDSN(dsn string) string {
+	schemeEnd := strings.Index(dsn, "://")
+	if schemeEnd == -1 {
+		return dsn
+	}
+
+	rest := dsn[schemeEnd+3:]
+	lastAt := strings.LastIndex(rest, "@")
+	if lastAt == -1 {
+		return dsn // no userinfo
+	}
+
+	userinfo := rest[:lastAt]
+	hostAndRest := rest[lastAt+1:]
+	scheme := dsn[:schemeEnd+3]
+
+	colonIdx := strings.Index(userinfo, ":")
+	if colonIdx == -1 {
+		// Username only, no password.
+		encoded := url.User(userinfo).String()
+		return scheme + encoded + "@" + hostAndRest
+	}
+
+	user := userinfo[:colonIdx]
+	pass := userinfo[colonIdx+1:]
+
+	encoded := url.UserPassword(user, pass).String()
+	return scheme + encoded + "@" + hostAndRest
 }
 
 func redactDSN(dsn string) string {

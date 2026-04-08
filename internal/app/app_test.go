@@ -1557,3 +1557,70 @@ func TestApplyDefaultsNewFields(t *testing.T) {
 		t.Fatalf("Expected default auto_offset_reset=earliest, got %q", cfg.AutoOffsetReset)
 	}
 }
+
+func TestSanitizeDSN(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "no userinfo unchanged",
+			in:   "clickhouse://host:9440/db?secure=true",
+			want: "clickhouse://host:9440/db?secure=true",
+		},
+		{
+			name: "plain credentials unchanged",
+			in:   "clickhouse://user:password@host:9440/db",
+			want: "clickhouse://user:password@host:9440/db",
+		},
+		{
+			name: "question mark in password encoded",
+			in:   "clickhouse://user:p4ss?w0rd@host:9440/db?secure=true",
+			want: "clickhouse://user:p4ss%3Fw0rd@host:9440/db?secure=true",
+		},
+		{
+			name: "at sign in password encoded",
+			in:   "clickhouse://user:p@ss@host:9000/db",
+			want: "clickhouse://user:p%40ss@host:9000/db",
+		},
+		{
+			name: "hash in password encoded",
+			in:   "clickhouse://user:p#ss@host:9000/db",
+			want: "clickhouse://user:p%23ss@host:9000/db",
+		},
+		{
+			name: "tcp scheme works",
+			in:   "tcp://user:p?ss@host:9000",
+			want: "tcp://user:p%3Fss@host:9000",
+		},
+		{
+			name: "no scheme unchanged",
+			in:   "localhost:9000",
+			want: "localhost:9000",
+		},
+		{
+			name: "empty string unchanged",
+			in:   "",
+			want: "",
+		},
+		{
+			name: "username only no password",
+			in:   "clickhouse://user@host:9000/db",
+			want: "clickhouse://user@host:9000/db",
+		},
+		{
+			name: "multiple special chars in password",
+			in:   "clickhouse://user:a?b#c@@host:9000/db",
+			want: "clickhouse://user:a%3Fb%23c%40@host:9000/db",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeDSN(tt.in)
+			if got != tt.want {
+				t.Errorf("sanitizeDSN(%q)\n got  %q\n want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

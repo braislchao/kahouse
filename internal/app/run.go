@@ -68,7 +68,7 @@ func Run() {
 	}
 
 	// Shared ClickHouse connection
-	chOptions, err := clickhouse.ParseDSN(cfg.ClickHouseDSN)
+	chOptions, err := clickhouse.ParseDSN(sanitizeDSN(cfg.ClickHouseDSN))
 	if err != nil {
 		sugar.Errorf("Failed to parse ClickHouse DSN: %v", err)
 		return
