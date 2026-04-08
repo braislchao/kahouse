@@ -12,6 +12,9 @@ import (
 
 const confluentMagicByte byte = 0x0
 
+// maxCodecCacheSize is the upper bound on cached Avro codecs. When exceeded, the entire cache is cleared
+const maxCodecCacheSize = 512
+
 var avroPrimitiveUnionBranches = map[string]struct{}{
 	"null":    {},
 	"boolean": {},
@@ -129,6 +132,10 @@ func (d *AvroDecoder) codecFor(topic string, schemaID int) (*goavro.Codec, error
 	defer d.mu.Unlock()
 	if existing, ok := d.codecs[schemaID]; ok {
 		return existing, nil
+	}
+	// Evict all entries when cache grows beyond the limit
+	if len(d.codecs) >= maxCodecCacheSize {
+		d.codecs = make(map[int]*goavro.Codec)
 	}
 	d.codecs[schemaID] = codec
 	return codec, nil

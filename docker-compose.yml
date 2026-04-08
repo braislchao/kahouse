@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
@@ -104,17 +102,17 @@ services:
       KAHOUSE_STRING_VALUE_COLUMN: ${KAHOUSE_STRING_VALUE_COLUMN:-value}
     command: >-
       if [ "$$KAHOUSE_INPUT_FORMAT" = "string" ]; then
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test ($$KAHOUSE_STRING_VALUE_COLUMN String, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders ($$KAHOUSE_STRING_VALUE_COLUMN String, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments ($$KAHOUSE_STRING_VALUE_COLUMN String, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192";
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test ($$KAHOUSE_STRING_VALUE_COLUMN String) ENGINE = MergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders ($$KAHOUSE_STRING_VALUE_COLUMN String) ENGINE = MergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments ($$KAHOUSE_STRING_VALUE_COLUMN String) ENGINE = MergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192";
       elif [ "$$KAHOUSE_INPUT_FORMAT" = "json" ]; then
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192";
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test (id Int64, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments (id Int64, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192";
       else
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192" &&
-      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192";
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.test (id Int32, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.orders (id Int32, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192" &&
+      clickhouse-client --host clickhouse --query "CREATE TABLE IF NOT EXISTS default.payments (id Int32, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192";
       fi &&
       echo 'ClickHouse tables created successfully!'
 
@@ -129,19 +127,8 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-    environment:
-      KAHOUSE_KAFKA_BROKERS: kafka:29092
-      KAHOUSE_SCHEMA_REGISTRY: http://schema-registry:8081
-      KAHOUSE_CLICKHOUSE_DSN: tcp://clickhouse:9000?debug=false
-      KAHOUSE_GROUP_ID: kahouse
-      KAHOUSE_INPUT_FORMAT: ${KAHOUSE_INPUT_FORMAT:-avro}
-      KAHOUSE_STRING_VALUE_COLUMN: ${KAHOUSE_STRING_VALUE_COLUMN:-value}
-      KAHOUSE_BATCH_SIZE: 100
-      KAHOUSE_BATCH_DELAY_MS: 1000
-      KAHOUSE_DLQ_TOPIC_SUFFIX: .dlq
-      KAHOUSE_MAX_RETRIES: 3
-      KAHOUSE_RETRY_BACKOFF_MS: 100
-      KAHOUSE_TOPIC_TABLES: ${KAHOUSE_TOPIC_TABLES}
+    volumes:
+      - ./scripts/test-config.yaml:/kahouse.yaml:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9090/readyz || exit 1"]
       interval: 10s

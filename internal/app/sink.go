@@ -122,7 +122,9 @@ func NewSinkTask(
 	}
 
 	if err := consumer.SubscribeTopics([]string{mapping.Topic}, nil); err != nil {
-		consumer.Close()
+		if closeErr := consumer.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to subscribe to topic %s: %w (consumer close failed: %v)", mapping.Topic, err, closeErr)
+		}
 		return nil, fmt.Errorf("failed to subscribe to topic %s: %w", mapping.Topic, err)
 	}
 
@@ -143,7 +145,11 @@ func NewSinkTask(
 // Batches are flushed when they reach batch_size or after batch_delay_ms of inactivity.
 // After a successful write, offsets are committed via the consumer group protocol.
 func (t *SinkTask) Run(ctx context.Context) {
-	defer t.consumer.Close()
+	defer func() {
+		if err := t.consumer.Close(); err != nil {
+			t.sugar.Errorf("Failed to close Kafka consumer: %v", err)
+		}
+	}()
 	defer t.stopped.Store(true)
 	defer taskStopped.WithLabelValues(t.mapping.Topic).Set(1)
 
@@ -163,7 +169,10 @@ func (t *SinkTask) Run(ctx context.Context) {
 		case <-ctx.Done():
 			t.sugar.Info("Context closed, flushing remaining batch")
 			if len(batch) > 0 {
-				t.flush(context.Background(), table, batch, firstInBatch)
+				// Use a bounded context for the final flush so we don't block shutdown indefinitely.
+				flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				t.flush(flushCtx, table, batch, firstInBatch)
+				flushCancel()
 			}
 			return
 		default:
@@ -174,8 +183,8 @@ func (t *SinkTask) Run(ctx context.Context) {
 		if err != nil {
 			if kafkaErr, ok := err.(kafka.Error); ok {
 				switch kafkaErr.Code() {
-				case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
-					// No message available — check if the batch delay has expired.
+			case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
+				// Check if the batch delay has expired.
 					if len(batch) > 0 && time.Since(firstInBatch) >= batchDelay {
 						t.sugar.Infof("Batch delay reached (%d messages), flushing", len(batch))
 						if !t.flush(ctx, table, batch, firstInBatch) {

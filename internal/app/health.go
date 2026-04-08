@@ -41,11 +41,15 @@ func NewHealth(logger *zap.SugaredLogger, chConn driver.Conn, tasks func() []sin
 func (h *Health) Livez(w http.ResponseWriter, r *http.Request) {
 	if h.allTasksStopped() {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("All sink tasks have stopped"))
+		if _, err := w.Write([]byte("All sink tasks have stopped")); err != nil {
+			h.logger.Warnf("Failed to write livez response: %v", err)
+		}
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		h.logger.Warnf("Failed to write livez response: %v", err)
+	}
 }
 
 // allTasksStopped returns true when every registered task has exited.
@@ -69,12 +73,16 @@ func (h *Health) Readyz(w http.ResponseWriter, r *http.Request) {
 	if err := h.readinessError(ctx); err != nil {
 		h.logger.Warnf("Readiness check failed: %v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("Not Ready: " + err.Error()))
+		if _, writeErr := w.Write([]byte("Not Ready: " + err.Error())); writeErr != nil {
+			h.logger.Warnf("Failed to write readyz response: %v", writeErr)
+		}
 		return
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		h.logger.Warnf("Failed to write readyz response: %v", err)
+	}
 }
 
 func (h *Health) readinessError(ctx context.Context) error {

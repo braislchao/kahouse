@@ -31,7 +31,11 @@ func Run() {
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
-	defer logger.Sync()
+	defer func() {
+		if err := logger.Sync(); err != nil {
+			log.Printf("Failed to sync logger: %v", err)
+		}
+	}()
 	sugar := logger.Sugar()
 
 	sugar.Infow("Loaded configuration", configLogFields(cfg)...)
@@ -62,8 +66,7 @@ func Run() {
 		}
 		srClient, err = schemaregistry.NewClient(srCfg)
 		if err != nil {
-			sugar.Errorf("Failed to create Schema Registry client: %v", err)
-			return
+			log.Fatalf("Failed to create Schema Registry client: %v", err)
 		}
 	}
 
@@ -80,9 +83,13 @@ func Run() {
 		sugar.Errorf("Failed to open ClickHouse connection: %v", err)
 		return
 	}
-	defer chConn.Close()
+	defer func() {
+		if err := chConn.Close(); err != nil {
+			sugar.Errorf("Failed to close ClickHouse connection: %v", err)
+		}
+	}()
 
-	if err := chConn.Ping(context.Background()); err != nil {
+	if err := chConn.Ping(ctx); err != nil {
 		sugar.Errorf("Failed to ping ClickHouse: %v", err)
 		return
 	}
@@ -139,7 +146,7 @@ func Run() {
 	sugar.Info("All sink tasks started, waiting for shutdown signal")
 	mgr.Wait()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeoutS)*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		sugar.Errorf("Server shutdown error: %v", err)

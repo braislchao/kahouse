@@ -90,7 +90,7 @@ ORDER BY id
 
 For `Nullable` Avro fields, use `Nullable(T)` column types. For sparse JSON (where records may have different keys), all columns that might be absent should be `Nullable`.
 
-Async inserts are enabled by default (`async_insert=1, wait_for_async_insert=1`).
+Async inserts are disabled by default (opt-in). Enable them with `clickhouse_async_insert: true` and optionally `clickhouse_wait_for_async_insert: true` in the config file.
 
 ## Error handling
 
@@ -120,10 +120,13 @@ Each DLQ record is a JSON object:
   "original_topic": "orders",
   "error": "failed to decode message: ...",
   "timestamp": 1712345678000,
-  "key": "...",
-  "value": "...raw message..."
+  "key_base64": "b3JkZXItMTIz",
+  "value_base64": "eyJpZCI6IDEyM30=",
+  "payload_encoding": "base64"
 }
 ```
+
+Key and value are base64-encoded to preserve binary payloads (e.g. Avro).
 
 ## Observability
 
