@@ -41,7 +41,7 @@ type Config struct {
 	SchemaRegistryPassword string `yaml:"schema_registry_password"`
 
 	// Consumer offset reset policy
-	AutoOffsetReset string `mapstructure:"auto_offset_reset"`
+	AutoOffsetReset string `yaml:"auto_offset_reset"`
 
 	// Kafka authentication (all optional — omit for unauthenticated clusters)
 	KafkaSecurityProtocol string `yaml:"kafka_security_protocol"`
@@ -54,16 +54,16 @@ type Config struct {
 	MetricsPort int `yaml:"metrics_port"`
 
 	// ClickHouse connection pool
-	ClickHouseMaxOpenConns int `mapstructure:"clickhouse_max_open_conns"`
-	ClickHouseMaxIdleConns int `mapstructure:"clickhouse_max_idle_conns"`
+	ClickHouseMaxOpenConns int `yaml:"clickhouse_max_open_conns"`
+	ClickHouseMaxIdleConns int `yaml:"clickhouse_max_idle_conns"`
 
 	// ClickHouse async insert settings
-	ClickHouseAsyncInsert        bool `mapstructure:"clickhouse_async_insert"`
-	ClickHouseWaitForAsyncInsert bool `mapstructure:"clickhouse_wait_for_async_insert"`
+	ClickHouseAsyncInsert        bool `yaml:"clickhouse_async_insert"`
+	ClickHouseWaitForAsyncInsert bool `yaml:"clickhouse_wait_for_async_insert"`
 
 	// Kafka consumer timeout settings
-	KafkaSessionTimeoutMs  int `mapstructure:"kafka_session_timeout_ms"`
-	KafkaMaxPollIntervalMs int `mapstructure:"kafka_max_poll_interval_ms"`
+	KafkaSessionTimeoutMs  int `yaml:"kafka_session_timeout_ms"`
+	KafkaMaxPollIntervalMs int `yaml:"kafka_max_poll_interval_ms"`
 
 	// Batch defaults (overridable per topic)
 	BatchSize      int  `yaml:"batch_size"`

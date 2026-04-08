@@ -8,6 +8,7 @@ group_id: "kahouse"
 dlq_topic_suffix: ".dlq"
 input_format: "avro"           # avro | json | string
 string_value_column: "value"   # used only when input_format is string
+auto_offset_reset: "earliest"  # earliest | latest | none
 
 # Schema Registry authentication (optional — omit for unauthenticated registries)
 # For Confluent Cloud, use your Schema Registry API key and secret.
@@ -24,6 +25,18 @@ string_value_column: "value"   # used only when input_format is string
 
 # Server settings
 metrics_port: 9090
+
+# ClickHouse connection pool
+clickhouse_max_open_conns: 5
+clickhouse_max_idle_conns: 5
+
+# ClickHouse async insert settings (opt-in, both default to false)
+# clickhouse_async_insert: true
+# clickhouse_wait_for_async_insert: true
+
+# Kafka consumer timeout settings
+kafka_session_timeout_ms: 45000
+kafka_max_poll_interval_ms: 300000
 
 # Global defaults (can be overridden per topic)
 batch_size: 10000

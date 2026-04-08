@@ -15,6 +15,7 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func Run() {
@@ -23,7 +24,10 @@ func Run() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	logger, err := zap.NewProduction()
+	prodCfg := zap.NewProductionConfig()
+	prodCfg.EncoderConfig.TimeKey = "ts"
+	prodCfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	logger, err := prodCfg.Build()
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}

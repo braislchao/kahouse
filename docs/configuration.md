@@ -25,6 +25,14 @@ These fields have defaults for local development, but you will always set them e
 | `schema_registry` | string | `http://localhost:8081` | Confluent Schema Registry URL. Required when any topic uses `avro`. |
 | `string_value_column` | string | `value` | ClickHouse column name for `string` format messages. Required when any topic uses `string`. |
 
+### Consumer
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auto_offset_reset` | string | `earliest` | Where to start consuming when no committed offset exists. One of `earliest`, `latest`, or `none`. |
+| `kafka_session_timeout_ms` | int | `45000` | Kafka consumer session timeout in milliseconds. Must be > 0. |
+| `kafka_max_poll_interval_ms` | int | `300000` | Maximum time between poll calls before the consumer is considered failed, in milliseconds. Must be > 0. |
+
 ### Batching and retries
 
 | Field | Type | Default | Description |
@@ -45,6 +53,15 @@ These fields have defaults for local development, but you will always set them e
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `metrics_port` | int | `9090` | HTTP port for health endpoints, admin API, and Prometheus metrics. |
+
+### ClickHouse connection
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `clickhouse_max_open_conns` | int | `5` | Maximum number of open connections to ClickHouse. Must be >= 1. |
+| `clickhouse_max_idle_conns` | int | `5` | Maximum number of idle connections in the pool. Must be >= 1. |
+| `clickhouse_async_insert` | bool | `false` | Enable ClickHouse async inserts (`async_insert=1`). |
+| `clickhouse_wait_for_async_insert` | bool | `false` | Wait for async insert to complete before returning (`wait_for_async_insert=1`). Only relevant when `clickhouse_async_insert` is `true`. |
 
 ### Kafka authentication
 
@@ -120,6 +137,7 @@ schema_registry: "http://schema-registry:8081"
 clickhouse_dsn: "tcp://clickhouse:9000"
 group_id: "prod"
 input_format: "avro"
+auto_offset_reset: "earliest"
 dlq_topic_suffix: ".dlq"
 
 batch_size: 10000
@@ -128,6 +146,14 @@ max_retries: 5
 retry_backoff_ms: 100
 
 metrics_port: 9090
+
+clickhouse_max_open_conns: 5
+clickhouse_max_idle_conns: 5
+clickhouse_async_insert: false
+clickhouse_wait_for_async_insert: false
+
+kafka_session_timeout_ms: 45000
+kafka_max_poll_interval_ms: 300000
 
 kafka_security_protocol: "SASL_SSL"
 kafka_sasl_mechanism: "PLAIN"
@@ -162,6 +188,9 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `schema_registry` is required when any topic uses `avro` format.
 - `string_value_column` is required (globally or per-topic) when the resolved format is `string`.
 - `input_format` must be one of `avro`, `json`, or `string`.
+- `auto_offset_reset` must be one of `earliest`, `latest`, or `none`.
+- `clickhouse_max_open_conns` and `clickhouse_max_idle_conns` must be >= 1.
+- `kafka_session_timeout_ms` and `kafka_max_poll_interval_ms` must be > 0.
 - `batch_size` must be >= 1 (both global and per-topic).
 - `batch_delay_ms`, `max_retries`, `retry_backoff_ms` must be >= 0.
 - `topic_tables` must have at least one entry.
