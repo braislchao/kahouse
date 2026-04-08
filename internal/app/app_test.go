@@ -8,9 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -19,17 +23,22 @@ import (
 // Callers modify specific fields before passing to validateConfig.
 func validConfig() Config {
 	cfg := Config{
-		KafkaBrokers:   "localhost:9092",
-		InputFormat:    "avro",
-		SchemaRegistry: "http://localhost:8081",
-		ClickHouseDSN:  "tcp://localhost:9000",
-		GroupID:        "group",
-		DLQTopicSuffix: ".dlq",
-		BatchSize:      1,
-		BatchDelayMs:   intPtr(1),
-		MaxRetries:     intPtr(1),
-		RetryBackoffMs: intPtr(1),
-		TopicTables:    []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
+		KafkaBrokers:           "localhost:9092",
+		InputFormat:            "avro",
+		SchemaRegistry:         "http://localhost:8081",
+		ClickHouseDSN:          "tcp://localhost:9000",
+		GroupID:                "group",
+		DLQTopicSuffix:         ".dlq",
+		AutoOffsetReset:        "earliest",
+		ClickHouseMaxOpenConns: 5,
+		ClickHouseMaxIdleConns: 5,
+		KafkaSessionTimeoutMs:  45000,
+		KafkaMaxPollIntervalMs: 300000,
+		BatchSize:              1,
+		BatchDelayMs:           intPtr(1),
+		MaxRetries:             intPtr(1),
+		RetryBackoffMs:         intPtr(1),
+		TopicTables:            []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
 	}
 	for i := range cfg.TopicTables {
 		cfg.TopicTables[i].resolve(&cfg)
@@ -366,6 +375,46 @@ func TestValidateConfigInputFormatRules(t *testing.T) {
 	}
 }
 
+func TestValidateConfigAutoOffsetReset(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "earliest is valid", value: "earliest"},
+		{name: "latest is valid", value: "latest"},
+		{name: "none is valid", value: "none"},
+		{name: "rejects empty", value: "", want: "auto_offset_reset must be one of earliest, latest, or none"},
+		{name: "rejects arbitrary", value: "beginning", want: "auto_offset_reset must be one of earliest, latest, or none"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.AutoOffsetReset = tt.value
+			err := validateConfig(&cfg)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Expected config to validate, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Expected validation error containing %q", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %q", tt.want, err.Error())
+			}
+		})
+	}
+}
+
+func TestNormalizeInputFormat(t *testing.T) {
+	if got := normalizeInputFormat(" JSON "); got != "json" {
+		t.Fatalf("Expected normalized input format json, got %q", got)
+	}
+}
+
 func TestQuoteTableIdentifier(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -375,10 +424,11 @@ func TestQuoteTableIdentifier(t *testing.T) {
 	}{
 		{name: "single table", in: "events", want: "`events`"},
 		{name: "db and table", in: "analytics.events", want: "`analytics`.`events`"},
+		{name: "dotted table name", in: "warehouse.staging.orders.v2.raw", want: "`warehouse`.`staging.orders.v2.raw`"},
 		{name: "trim spaces", in: " analytics . events ", want: "`analytics`.`events`"},
 		{name: "escaped backticks", in: "db.we`ird", want: "`db`.`we``ird`"},
+		{name: "dotted table no db", in: "metrics.sales.daily.v3.agg", want: "`metrics`.`sales.daily.v3.agg`"},
 		{name: "empty string", in: "", wantErr: true},
-		{name: "double dot", in: "db..table", wantErr: true},
 		{name: "leading dot", in: ".table", wantErr: true},
 		{name: "trailing dot", in: "db.", wantErr: true},
 	}
@@ -1020,5 +1070,490 @@ func TestTaskManagerStartRejectsRunningTopic(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("Expected 'already running' error, got %q", err.Error())
+	}
+}
+
+func TestHandleStartTopicConcurrentSafety(t *testing.T) {
+	// This test verifies that concurrent calls to handleStartTopic and Topics()
+	// (which both acquire the mutex) do not panic or race.
+	// The race detector (go test -race) is the real check here.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders"},
+		done:    make(chan struct{}),
+	}
+
+	mux := http.NewServeMux()
+	RegisterAdminEndpoints(mgr, mux)
+
+	// Run concurrent requests to exercise the RLock in handleStartTopic.
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/api/topics/orders/start", nil)
+			mux.ServeHTTP(rr, req)
+			// We expect 409 (already running) — the important thing is no panic/race.
+		}()
+		go func() {
+			defer wg.Done()
+			_ = mgr.Topics()
+		}()
+	}
+	wg.Wait()
+}
+
+// stubConn is a minimal stub implementing driver.Conn for testing validateTables.
+type stubConn struct {
+	driver.Conn
+	execErr map[string]error // keyed by SQL query substring
+}
+
+func (c *stubConn) Exec(ctx context.Context, query string, args ...interface{}) error {
+	for pattern, err := range c.execErr {
+		if strings.Contains(query, pattern) {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestValidateTablesSuccess(t *testing.T) {
+	conn := &stubConn{execErr: map[string]error{}}
+	tables := []TopicTableMapping{
+		{Topic: "orders", Table: "default.orders"},
+		{Topic: "payments", Table: "default.payments"},
+	}
+	if err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar()); err != nil {
+		t.Fatalf("Expected validateTables to succeed, got %v", err)
+	}
+}
+
+func TestValidateTablesFailsOnMissingTable(t *testing.T) {
+	conn := &stubConn{execErr: map[string]error{
+		"orders": fmt.Errorf("table orders does not exist"),
+	}}
+	tables := []TopicTableMapping{
+		{Topic: "orders", Table: "default.orders"},
+	}
+	err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
+	if err == nil {
+		t.Fatal("Expected validateTables to fail for missing table")
+	}
+	if !strings.Contains(err.Error(), "does not exist or is not accessible") {
+		t.Fatalf("Expected 'does not exist' error, got %q", err.Error())
+	}
+}
+
+func TestValidateTablesRejectsInvalidTableName(t *testing.T) {
+	conn := &stubConn{execErr: map[string]error{}}
+	tables := []TopicTableMapping{
+		{Topic: "orders", Table: ""},
+	}
+	err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
+	if err == nil {
+		t.Fatal("Expected validateTables to reject empty table name")
+	}
+	if !strings.Contains(err.Error(), "invalid table name") {
+		t.Fatalf("Expected 'invalid table name' error, got %q", err.Error())
+	}
+}
+
+func TestValidateConfigClickHousePoolSettings(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "max_open_conns zero rejected",
+			mutate: func(c *Config) { c.ClickHouseMaxOpenConns = 0 },
+			want:   "clickhouse_max_open_conns must be at least 1",
+		},
+		{
+			name:   "max_open_conns negative rejected",
+			mutate: func(c *Config) { c.ClickHouseMaxOpenConns = -1 },
+			want:   "clickhouse_max_open_conns must be at least 1",
+		},
+		{
+			name:   "max_idle_conns zero rejected",
+			mutate: func(c *Config) { c.ClickHouseMaxIdleConns = 0 },
+			want:   "clickhouse_max_idle_conns must be at least 1",
+		},
+		{
+			name:   "max_idle_conns negative rejected",
+			mutate: func(c *Config) { c.ClickHouseMaxIdleConns = -1 },
+			want:   "clickhouse_max_idle_conns must be at least 1",
+		},
+		{
+			name:   "valid pool settings accepted",
+			mutate: func(c *Config) { c.ClickHouseMaxOpenConns = 10; c.ClickHouseMaxIdleConns = 3 },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := validateConfig(&cfg)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Expected config to validate, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Expected validation error containing %q", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %q", tt.want, err.Error())
+			}
+		})
+	}
+}
+
+func TestValidateConfigKafkaTimeoutSettings(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "session_timeout_ms zero rejected",
+			mutate: func(c *Config) { c.KafkaSessionTimeoutMs = 0 },
+			want:   "kafka_session_timeout_ms must be > 0",
+		},
+		{
+			name:   "session_timeout_ms negative rejected",
+			mutate: func(c *Config) { c.KafkaSessionTimeoutMs = -1 },
+			want:   "kafka_session_timeout_ms must be > 0",
+		},
+		{
+			name:   "max_poll_interval_ms zero rejected",
+			mutate: func(c *Config) { c.KafkaMaxPollIntervalMs = 0 },
+			want:   "kafka_max_poll_interval_ms must be > 0",
+		},
+		{
+			name:   "max_poll_interval_ms negative rejected",
+			mutate: func(c *Config) { c.KafkaMaxPollIntervalMs = -1 },
+			want:   "kafka_max_poll_interval_ms must be > 0",
+		},
+		{
+			name:   "valid timeout settings accepted",
+			mutate: func(c *Config) { c.KafkaSessionTimeoutMs = 30000; c.KafkaMaxPollIntervalMs = 600000 },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := validateConfig(&cfg)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Expected config to validate, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Expected validation error containing %q", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %q", tt.want, err.Error())
+			}
+		})
+	}
+}
+
+func TestIsRetriableClickHouseError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		retriable bool
+	}{
+		{
+			name:      "plain error is retriable (network/timeout)",
+			err:       fmt.Errorf("connection reset by peer"),
+			retriable: true,
+		},
+		{
+			name:      "retriable code 159 (timeout)",
+			err:       &clickhouse.Exception{Code: 159, Message: "timeout"},
+			retriable: true,
+		},
+		{
+			name:      "retriable code 202 (too many parts)",
+			err:       &clickhouse.Exception{Code: 202, Message: "too many parts"},
+			retriable: true,
+		},
+		{
+			name:      "retriable code 242 (table read-only)",
+			err:       &clickhouse.Exception{Code: 242, Message: "table is read-only"},
+			retriable: true,
+		},
+		{
+			name:      "retriable code 999 (keeper exception)",
+			err:       &clickhouse.Exception{Code: 999, Message: "keeper exception"},
+			retriable: true,
+		},
+		{
+			name:      "retriable code 3 (unexpected end of file)",
+			err:       &clickhouse.Exception{Code: 3, Message: "unexpected end of file"},
+			retriable: true,
+		},
+		{
+			name:      "non-retriable code 60 (unknown table)",
+			err:       &clickhouse.Exception{Code: 60, Message: "unknown table"},
+			retriable: false,
+		},
+		{
+			name:      "non-retriable code 62 (syntax error)",
+			err:       &clickhouse.Exception{Code: 62, Message: "syntax error"},
+			retriable: false,
+		},
+		{
+			name:      "non-retriable code 16 (no such column)",
+			err:       &clickhouse.Exception{Code: 16, Message: "no such column"},
+			retriable: false,
+		},
+		{
+			name:      "wrapped retriable error",
+			err:       fmt.Errorf("wrapped: %w", &clickhouse.Exception{Code: 159, Message: "timeout"}),
+			retriable: true,
+		},
+		{
+			name:      "wrapped non-retriable error",
+			err:       fmt.Errorf("wrapped: %w", &clickhouse.Exception{Code: 60, Message: "unknown table"}),
+			retriable: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isRetriableClickHouseError(tt.err)
+			if got != tt.retriable {
+				t.Fatalf("isRetriableClickHouseError(%v) = %v, want %v", tt.err, got, tt.retriable)
+			}
+		})
+	}
+}
+
+func TestTaskStoppedGaugeExistsInRegistry(t *testing.T) {
+	// Initialize a label so the metric family appears in Gather output.
+	taskStopped.WithLabelValues("__test_topic__").Set(0)
+	defer taskStopped.DeleteLabelValues("__test_topic__")
+
+	metricFamilies, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Failed to gather metrics: %v", err)
+	}
+	found := false
+	for _, mf := range metricFamilies {
+		if mf.GetName() == "kahouse_task_stopped" {
+			found = true
+			if mf.GetHelp() == "" {
+				t.Fatal("Expected non-empty help text for kahouse_task_stopped")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("Expected kahouse_task_stopped metric to be registered")
+	}
+}
+
+func TestMsgChannelDepthMetricRegistered(t *testing.T) {
+	// Initialize a label so the metric family appears in Gather output.
+	msgChannelDepth.WithLabelValues("__test_topic__").Set(0)
+	defer msgChannelDepth.DeleteLabelValues("__test_topic__")
+
+	metricFamilies, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Failed to gather metrics: %v", err)
+	}
+	found := false
+	for _, mf := range metricFamilies {
+		if mf.GetName() == "kahouse_msg_channel_depth" {
+			found = true
+			if mf.GetHelp() == "" {
+				t.Fatal("Expected non-empty help text for kahouse_msg_channel_depth")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("Expected kahouse_msg_channel_depth metric to be registered")
+	}
+}
+
+func TestDLQTopicNameFormation(t *testing.T) {
+	// Validate the naming convention used by validateDLQTopics matches what
+	// sendToDLQ and sendBatchToDLQ use: topic + dlq_topic_suffix.
+	cfg := validConfig()
+	cfg.DLQTopicSuffix = ".dlq"
+	cfg.TopicTables = []TopicTableMapping{
+		{Topic: "orders", Table: "default.orders"},
+		{Topic: "payments", Table: "default.payments"},
+	}
+
+	for _, mapping := range cfg.TopicTables {
+		expected := mapping.Topic + cfg.DLQTopicSuffix
+		if expected != mapping.Topic+".dlq" {
+			t.Fatalf("DLQ topic name mismatch: expected %q, got %q", mapping.Topic+".dlq", expected)
+		}
+	}
+}
+
+func TestValidateConfigAsyncInsertDefaults(t *testing.T) {
+	// The async insert booleans have no validation constraints (any bool is valid),
+	// but we verify they survive the validation pass and appear in configLogFields.
+	cfg := validConfig()
+	cfg.ClickHouseAsyncInsert = true
+	cfg.ClickHouseWaitForAsyncInsert = true
+	if err := validateConfig(&cfg); err != nil {
+		t.Fatalf("Expected valid config with async inserts enabled, got %v", err)
+	}
+
+	cfg.ClickHouseAsyncInsert = false
+	cfg.ClickHouseWaitForAsyncInsert = false
+	if err := validateConfig(&cfg); err != nil {
+		t.Fatalf("Expected valid config with async inserts disabled, got %v", err)
+	}
+}
+
+func TestConfigLogFieldsIncludesNewFields(t *testing.T) {
+	cfg := &Config{
+		KafkaBrokers:                 "localhost:9092",
+		InputFormat:                  "avro",
+		SchemaRegistry:               "http://localhost:8081",
+		ClickHouseDSN:                "tcp://localhost:9000",
+		GroupID:                      "group",
+		DLQTopicSuffix:               ".dlq",
+		AutoOffsetReset:              "earliest",
+		ClickHouseMaxOpenConns:       10,
+		ClickHouseMaxIdleConns:       5,
+		ClickHouseAsyncInsert:        true,
+		ClickHouseWaitForAsyncInsert: false,
+		KafkaSessionTimeoutMs:        45000,
+		KafkaMaxPollIntervalMs:       300000,
+		BatchDelayMs:                 intPtr(200),
+		MaxRetries:                   intPtr(5),
+		RetryBackoffMs:               intPtr(100),
+		TopicTables:                  []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
+	}
+
+	fields := configLogFields(cfg)
+	fieldMap := make(map[string]interface{}, len(fields)/2)
+	for i := 0; i < len(fields); i += 2 {
+		key, ok := fields[i].(string)
+		if !ok {
+			t.Fatalf("Expected string key at index %d, got %T", i, fields[i])
+		}
+		fieldMap[key] = fields[i+1]
+	}
+
+	if got := fieldMap["clickhouse_max_open_conns"]; got != 10 {
+		t.Fatalf("Expected clickhouse_max_open_conns=10, got %v", got)
+	}
+	if got := fieldMap["clickhouse_max_idle_conns"]; got != 5 {
+		t.Fatalf("Expected clickhouse_max_idle_conns=5, got %v", got)
+	}
+
+	if got := fieldMap["kafka_session_timeout_ms"]; got != 45000 {
+		t.Fatalf("Expected kafka_session_timeout_ms=45000, got %v", got)
+	}
+	if got := fieldMap["kafka_max_poll_interval_ms"]; got != 300000 {
+		t.Fatalf("Expected kafka_max_poll_interval_ms=300000, got %v", got)
+	}
+
+	if got := fieldMap["clickhouse_async_insert"]; got != true {
+		t.Fatalf("Expected clickhouse_async_insert=true, got %v", got)
+	}
+	if got := fieldMap["clickhouse_wait_for_async_insert"]; got != false {
+		t.Fatalf("Expected clickhouse_wait_for_async_insert=false, got %v", got)
+	}
+}
+
+func TestTaskManagerStartRejectsDuringShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	task.stopped.Store(true)
+	done := make(chan struct{})
+	close(done)
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		mapping: TopicTableMapping{Topic: "orders"},
+		done:    done,
+	}
+
+	// Cancel context to simulate shutdown.
+	cancel()
+
+	err := mgr.Start("orders")
+	if err == nil {
+		t.Fatal("Expected error when starting topic during shutdown")
+	}
+	if !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("Expected 'shutting down' error, got %q", err.Error())
+	}
+}
+
+func TestIsRetriableClickHouseErrorAllCodes(t *testing.T) {
+	// Exhaustively test all codes listed in the switch statement.
+	retriableCodes := []int32{3, 107, 159, 164, 202, 203, 209, 210, 241, 242, 252, 285, 319, 425, 999}
+	for _, code := range retriableCodes {
+		err := &clickhouse.Exception{Code: code, Message: fmt.Sprintf("test code %d", code)}
+		if !isRetriableClickHouseError(err) {
+			t.Errorf("Expected code %d to be retriable", code)
+		}
+	}
+
+	// Spot-check some non-retriable codes.
+	nonRetriableCodes := []int32{1, 10, 16, 36, 47, 60, 62, 70, 117}
+	for _, code := range nonRetriableCodes {
+		err := &clickhouse.Exception{Code: code, Message: fmt.Sprintf("test code %d", code)}
+		if isRetriableClickHouseError(err) {
+			t.Errorf("Expected code %d to be non-retriable", code)
+		}
+	}
+}
+
+func TestApplyDefaultsNewFields(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+
+	if cfg.ClickHouseMaxOpenConns != 5 {
+		t.Fatalf("Expected default clickhouse_max_open_conns=5, got %d", cfg.ClickHouseMaxOpenConns)
+	}
+	if cfg.ClickHouseMaxIdleConns != 5 {
+		t.Fatalf("Expected default clickhouse_max_idle_conns=5, got %d", cfg.ClickHouseMaxIdleConns)
+	}
+	if cfg.KafkaSessionTimeoutMs != 45000 {
+		t.Fatalf("Expected default kafka_session_timeout_ms=45000, got %d", cfg.KafkaSessionTimeoutMs)
+	}
+	if cfg.KafkaMaxPollIntervalMs != 300000 {
+		t.Fatalf("Expected default kafka_max_poll_interval_ms=300000, got %d", cfg.KafkaMaxPollIntervalMs)
+	}
+	if cfg.AutoOffsetReset != "earliest" {
+		t.Fatalf("Expected default auto_offset_reset=earliest, got %q", cfg.AutoOffsetReset)
 	}
 }

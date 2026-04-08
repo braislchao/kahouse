@@ -69,6 +69,8 @@ func Run() {
 		sugar.Errorf("Failed to parse ClickHouse DSN: %v", err)
 		return
 	}
+	chOptions.MaxOpenConns = cfg.ClickHouseMaxOpenConns
+	chOptions.MaxIdleConns = cfg.ClickHouseMaxIdleConns
 	chConn, err := clickhouse.Open(chOptions)
 	if err != nil {
 		sugar.Errorf("Failed to open ClickHouse connection: %v", err)
@@ -81,6 +83,10 @@ func Run() {
 		return
 	}
 	sugar.Info("Connected to ClickHouse")
+
+	if err := validateTables(context.Background(), chConn, cfg.TopicTables, sugar); err != nil {
+		sugar.Fatalf("Table validation failed: %v", err)
+	}
 
 	// Shared DLQ producer
 	dlqKafkaConfig := buildKafkaConfig(kafka.ConfigMap{
@@ -98,6 +104,8 @@ func Run() {
 		for range dlqProducer.Events() {
 		}
 	}()
+
+	validateDLQTopics(dlqProducer, cfg, sugar)
 
 	// Create and start the task manager
 	mgr := NewTaskManager(ctx, cfg, chConn, srClient, dlqProducer, sugar)
@@ -134,4 +142,32 @@ func Run() {
 	}
 
 	sugar.Info("All sink tasks stopped, exiting")
+}
+
+// validateDLQTopics checks whether the DLQ topics for each configured mapping
+// exist in the Kafka cluster. It logs warnings for missing topics but never
+// fails startup — Kafka may be configured to auto-create them on first produce.
+func validateDLQTopics(producer *kafka.Producer, cfg *Config, sugar *zap.SugaredLogger) {
+	adminClient, err := kafka.NewAdminClientFromProducer(producer)
+	if err != nil {
+		sugar.Warnf("Could not create admin client to validate DLQ topics: %v", err)
+		return
+	}
+	defer adminClient.Close()
+
+	for _, mapping := range cfg.TopicTables {
+		dlqTopic := mapping.Topic + cfg.DLQTopicSuffix
+		metadata, err := adminClient.GetMetadata(&dlqTopic, false, 5000)
+		if err != nil {
+			sugar.Warnf("Could not fetch metadata for DLQ topic %q: %v", dlqTopic, err)
+			continue
+		}
+		if topicMeta, exists := metadata.Topics[dlqTopic]; exists {
+			if topicMeta.Error.Code() != kafka.ErrNoError {
+				sugar.Warnf("DLQ topic %q may not exist (error: %v). Ensure it is pre-created or auto-creation is enabled.", dlqTopic, topicMeta.Error)
+			} else {
+				sugar.Infof("Validated DLQ topic exists: %s", dlqTopic)
+			}
+		}
+	}
 }

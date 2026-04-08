@@ -58,15 +58,17 @@ func ParseRepairMode(s string) (RepairMode, error) {
 // Each task has its own lifecycle: when it encounters an unrecoverable error it stops
 // itself without affecting other tasks running in the same process.
 type SinkTask struct {
-	mapping        TopicTableMapping
-	dlqTopicSuffix string
-	chConn         driver.Conn
-	decoder        MessageDecoder
-	dlqProducer    *kafka.Producer
-	consumer       *kafka.Consumer
-	sugar          *zap.SugaredLogger
-	stopped        atomic.Bool
-	repairMode     atomic.Int32
+	mapping            TopicTableMapping
+	dlqTopicSuffix     string
+	chConn             driver.Conn
+	decoder            MessageDecoder
+	dlqProducer        *kafka.Producer
+	consumer           *kafka.Consumer
+	sugar              *zap.SugaredLogger
+	stopped            atomic.Bool
+	repairMode         atomic.Int32
+	asyncInsert        bool
+	waitForAsyncInsert bool
 }
 
 func (t *SinkTask) IsStopped() bool {
@@ -106,10 +108,12 @@ func NewSinkTask(
 	// Each topic gets a unique consumer group for full offset isolation.
 	groupID := "kahouse-" + strings.TrimSpace(cfg.GroupID) + "-" + mapping.Topic
 	kafkaConfig := buildKafkaConfig(kafka.ConfigMap{
-		"bootstrap.servers":  cfg.KafkaBrokers,
-		"group.id":           groupID,
-		"auto.offset.reset":  "latest",
-		"enable.auto.commit": false,
+		"bootstrap.servers":    cfg.KafkaBrokers,
+		"group.id":             groupID,
+		"auto.offset.reset":    cfg.AutoOffsetReset,
+		"enable.auto.commit":   false,
+		"session.timeout.ms":   cfg.KafkaSessionTimeoutMs,
+		"max.poll.interval.ms": cfg.KafkaMaxPollIntervalMs,
 	}, cfg)
 
 	consumer, err := kafka.NewConsumer(&kafkaConfig)
@@ -123,13 +127,15 @@ func NewSinkTask(
 	}
 
 	return &SinkTask{
-		mapping:        mapping,
-		dlqTopicSuffix: cfg.DLQTopicSuffix,
-		chConn:         chConn,
-		decoder:        decoder,
-		dlqProducer:    dlqProducer,
-		consumer:       consumer,
-		sugar:          sugar.With("topic", mapping.Topic),
+		mapping:            mapping,
+		dlqTopicSuffix:     cfg.DLQTopicSuffix,
+		chConn:             chConn,
+		decoder:            decoder,
+		dlqProducer:        dlqProducer,
+		consumer:           consumer,
+		sugar:              sugar.With("topic", mapping.Topic),
+		asyncInsert:        cfg.ClickHouseAsyncInsert,
+		waitForAsyncInsert: cfg.ClickHouseWaitForAsyncInsert,
 	}, nil
 }
 
@@ -291,7 +297,7 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 }
 
 // writeWithRetries attempts to write the batch, retrying with exponential backoff+jitter.
-// Returns the final error (nil on success) and the number of attempts made.
+// Returns the number of attempts made and the final error (nil on success).
 func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []map[string]interface{}) (int, error) {
 	maxRetries := *t.mapping.MaxRetries
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -308,7 +314,11 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 			}
 			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, wait)
 		}
-		if err := writeBatch(ctx, table, t.chConn, batch); err != nil {
+		if err := writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert); err != nil {
+			if !isRetriableClickHouseError(err) {
+				t.sugar.Errorf("Non-retriable ClickHouse error, skipping retries: %v", err)
+				return attempt + 1, err
+			}
 			if attempt == maxRetries {
 				t.sugar.Errorf("Batch write failed on final attempt %d/%d: %v", attempt+1, maxRetries+1, err)
 				return attempt + 1, err
