@@ -1,0 +1,25 @@
+# Integration test configuration for kahouse.
+# Covers all test scenarios: mixed-format success, avro DLQ, json DLQ, string DLQ.
+kafka_brokers: "kafka:29092"
+schema_registry: "http://schema-registry:8081"
+clickhouse_dsn: "tcp://clickhouse:9000?debug=false"
+group_id: "kahouse"
+input_format: "json"
+
+batch_size: 100
+batch_delay_ms: 1000
+max_retries: 3
+retry_backoff_ms: 100
+dlq_topic_suffix: ".dlq"
+
+topic_tables:
+  - topic: "test"
+    table: "default.test"
+    format: "avro"
+  - topic: "orders"
+    table: "default.orders"
+    format: "json"
+  - topic: "payments"
+    table: "default.payments"
+    format: "string"
+    string_value_column: "value"

@@ -101,6 +101,8 @@ func (m *TaskManager) startTask(mapping TopicTableMapping) error {
 		task.Run(taskCtx)
 	}()
 
+	taskStopped.WithLabelValues(mapping.Topic).Set(0)
+
 	m.logger.Infof("Started sink task: topic=%s table=%s format=%s", mapping.Topic, mapping.Table, mapping.Format)
 	return nil
 }
@@ -140,10 +142,14 @@ func (m *TaskManager) Start(topic string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("topic %q is already running", topic)
 	}
+	// Hold the lock reference to done, then wait outside the lock to avoid
+	// blocking other operations, but re-acquire for startTask.
+	done := mt.done
+	mapping := mt.mapping
 	m.mu.Unlock()
 
-	<-mt.done // ensure previous Run has fully returned
-	return m.startTask(mt.mapping)
+	<-done // ensure previous Run has fully returned
+	return m.startTask(mapping)
 }
 
 // Restart stops a topic (if running), creates a brand-new SinkTask, and launches it.
@@ -245,7 +251,9 @@ func (m *TaskManager) Wait() {
 
 func (m *TaskManager) handleListTopics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(m.Topics())
+	if err := json.NewEncoder(w).Encode(m.Topics()); err != nil {
+		m.logger.Errorf("Failed to encode topics response: %v", err)
+	}
 }
 
 func (m *TaskManager) handleStopTopic(w http.ResponseWriter, r *http.Request) {
@@ -259,7 +267,9 @@ func (m *TaskManager) handleStopTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "topic %q stopped", topic)
+	if _, err := fmt.Fprintf(w, "topic %q stopped", topic); err != nil {
+		m.logger.Errorf("Failed to write stop response for topic %s: %v", topic, err)
+	}
 }
 
 func (m *TaskManager) handleStartTopic(w http.ResponseWriter, r *http.Request) {
@@ -276,7 +286,9 @@ func (m *TaskManager) handleStartTopic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "topic %q started", topic)
+	if _, err := fmt.Fprintf(w, "topic %q started", topic); err != nil {
+		m.logger.Errorf("Failed to write start response for topic %s: %v", topic, err)
+	}
 }
 
 func (m *TaskManager) handleRestartTopic(w http.ResponseWriter, r *http.Request) {
@@ -287,7 +299,9 @@ func (m *TaskManager) handleRestartTopic(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "topic %q restarted", topic)
+	if _, err := fmt.Fprintf(w, "topic %q restarted", topic); err != nil {
+		m.logger.Errorf("Failed to write restart response for topic %s: %v", topic, err)
+	}
 }
 
 func (m *TaskManager) handleSetRepair(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +330,9 @@ func (m *TaskManager) handleSetRepair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "repair mode %q set for topic %q", mode, topic)
+	if _, err := fmt.Fprintf(w, "repair mode %q set for topic %q", mode, topic); err != nil {
+		m.logger.Errorf("Failed to write set repair response for topic %s: %v", topic, err)
+	}
 }
 
 func (m *TaskManager) handleClearRepair(w http.ResponseWriter, r *http.Request) {
@@ -326,7 +342,9 @@ func (m *TaskManager) handleClearRepair(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "repair mode cleared for topic %q", topic)
+	if _, err := fmt.Fprintf(w, "repair mode cleared for topic %q", topic); err != nil {
+		m.logger.Errorf("Failed to write clear repair response for topic %s: %v", topic, err)
+	}
 }
 
 // RegisterAdminEndpoints registers the admin API endpoints on the given mux.

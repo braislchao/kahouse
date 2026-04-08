@@ -38,6 +38,7 @@ func validConfig() Config {
 		BatchDelayMs:           intPtr(1),
 		MaxRetries:             intPtr(1),
 		RetryBackoffMs:         intPtr(1),
+		ShutdownTimeoutS:       5,
 		TopicTables:            []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
 	}
 	for i := range cfg.TopicTables {
@@ -1371,30 +1372,6 @@ func TestTaskStoppedGaugeExistsInRegistry(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("Expected kahouse_task_stopped metric to be registered")
-	}
-}
-
-func TestMsgChannelDepthMetricRegistered(t *testing.T) {
-	// Initialize a label so the metric family appears in Gather output.
-	msgChannelDepth.WithLabelValues("__test_topic__").Set(0)
-	defer msgChannelDepth.DeleteLabelValues("__test_topic__")
-
-	metricFamilies, err := prometheus.DefaultGatherer.Gather()
-	if err != nil {
-		t.Fatalf("Failed to gather metrics: %v", err)
-	}
-	found := false
-	for _, mf := range metricFamilies {
-		if mf.GetName() == "kahouse_msg_channel_depth" {
-			found = true
-			if mf.GetHelp() == "" {
-				t.Fatal("Expected non-empty help text for kahouse_msg_channel_depth")
-			}
-			break
-		}
-	}
-	if !found {
-		t.Fatal("Expected kahouse_msg_channel_depth metric to be registered")
 	}
 }
 

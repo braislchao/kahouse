@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -14,11 +15,12 @@ const dlqDeliveryTimeout = 30 * time.Second
 func sendToDLQ(producer *kafka.Producer, topic string, dlqSuffix string, key, value []byte, errorMsg string) error {
 	dlqTopic := topic + dlqSuffix
 	dlqRecord := map[string]interface{}{
-		"original_topic": topic,
-		"error":          errorMsg,
-		"timestamp":      time.Now().UnixMilli(),
-		"key":            string(key),
-		"value":          string(value),
+		"original_topic":   topic,
+		"error":            errorMsg,
+		"timestamp":        time.Now().UnixMilli(),
+		"key_base64":       base64.StdEncoding.EncodeToString(key),
+		"value_base64":     base64.StdEncoding.EncodeToString(value),
+		"payload_encoding": "base64",
 	}
 	payload, err := json.Marshal(dlqRecord)
 	if err != nil {

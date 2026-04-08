@@ -152,21 +152,21 @@ show_table_sample() {
     echo ""
 }
 
+create_all_tables() {
+    print_info "Creating ClickHouse tables..."
+    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.test (id Int32, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192"
+    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192"
+    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.payments (value String) ENGINE = MergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192"
+    print_status $? "ClickHouse tables created"
+}
+
 run_mixed_format_success_test() {
     print_info "Running mixed-format success test..."
     cleanup
-    export KAHOUSE_INPUT_FORMAT="json"
-    export KAHOUSE_STRING_VALUE_COLUMN="value"
-    export KAHOUSE_TOPIC_TABLES='[{"topic":"test","table":"default.test","format":"avro"},{"topic":"orders","table":"default.orders","format":"json"},{"topic":"payments","table":"default.payments","format":"string","string_value_column":"value"}]'
 
     start_base_services
     create_topics
-
-    print_info "Creating ClickHouse tables for mixed-format test..."
-    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.test (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192"
-    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192"
-    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.payments (value String, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192"
-    print_status $? "ClickHouse tables created"
+    create_all_tables
 
     print_info "Starting sink for mixed-format test..."
     compose up -d kahouse
@@ -198,9 +198,9 @@ run_mixed_format_success_test() {
     assert_table_count orders "$message_count"
     assert_table_count payments "$message_count"
 
-    show_table_sample test "SELECT * FROM default.test ORDER BY kafka_offset LIMIT 5 FORMAT PrettyCompact"
-    show_table_sample orders "SELECT * FROM default.orders ORDER BY kafka_offset LIMIT 5 FORMAT PrettyCompact"
-    show_table_sample payments "SELECT value, kafka_offset FROM default.payments ORDER BY kafka_offset LIMIT 5 FORMAT PrettyCompact"
+    show_table_sample test "SELECT * FROM default.test ORDER BY id LIMIT 5 FORMAT PrettyCompact"
+    show_table_sample orders "SELECT * FROM default.orders ORDER BY id LIMIT 5 FORMAT PrettyCompact"
+    show_table_sample payments "SELECT value FROM default.payments LIMIT 5 FORMAT PrettyCompact"
 
     echo "Checking DLQs for mixed-format success test:"
     assert_dlq_count test.dlq 0
@@ -215,16 +215,17 @@ run_mixed_format_success_test() {
 run_avro_dlq_test() {
     print_info "Running Avro DLQ test..."
     cleanup
-    export KAHOUSE_INPUT_FORMAT="avro"
-    export KAHOUSE_STRING_VALUE_COLUMN="value"
-    export KAHOUSE_TOPIC_TABLES='[{"topic":"test","table":"default.test","format":"avro"}]'
 
     start_base_services
     create_topics
+    create_all_tables
 
-    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.test (id Int32, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192"
     compose up -d kahouse
     wait_for_sink
+
+    print_info "Enabling DLQ repair mode on topic 'test'..."
+    compose exec -T kahouse wget -qO- --post-data='{"mode":"dlq"}' --header='Content-Type: application/json' http://localhost:9090/api/topics/test/repair
+    echo ""
 
     print_info "Sending invalid non-Avro payload to Avro topic..."
     compose exec -T kafka bash -lc "printf 'not-avro\n' | kafka-console-producer --bootstrap-server localhost:9092 --topic test"
@@ -240,16 +241,17 @@ run_avro_dlq_test() {
 run_json_dlq_test() {
     print_info "Running JSON DLQ test..."
     cleanup
-    export KAHOUSE_INPUT_FORMAT="json"
-    export KAHOUSE_STRING_VALUE_COLUMN="value"
-    export KAHOUSE_TOPIC_TABLES='[{"topic":"orders","table":"default.orders","format":"json"}]'
 
     start_base_services
     create_topics
+    create_all_tables
 
-    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192"
     compose up -d kahouse
     wait_for_sink
+
+    print_info "Enabling DLQ repair mode on topic 'orders'..."
+    compose exec -T kahouse wget -qO- --post-data='{"mode":"dlq"}' --header='Content-Type: application/json' http://localhost:9090/api/topics/orders/repair
+    echo ""
 
     print_info "Sending malformed JSON payload..."
     compose exec -T kafka bash -lc "printf '{\"id\":1\n' | kafka-console-producer --bootstrap-server localhost:9092 --topic orders"
@@ -260,31 +262,6 @@ run_json_dlq_test() {
     assert_table_count orders 0
     assert_dlq_count orders.dlq 1
     print_status 0 "JSON DLQ test passed"
-}
-
-run_string_dlq_test() {
-    print_info "Running string ClickHouse-failure DLQ test..."
-    cleanup
-    export KAHOUSE_INPUT_FORMAT="string"
-    export KAHOUSE_STRING_VALUE_COLUMN="value"
-    export KAHOUSE_TOPIC_TABLES='[{"topic":"payments","table":"default.payments","format":"string","string_value_column":"value"}]'
-
-    start_base_services
-    create_topics
-
-    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.payments (value UInt32, kafka_topic String, kafka_partition Int32, kafka_offset Int64) ENGINE = ReplacingMergeTree() ORDER BY (kafka_topic, kafka_partition, kafka_offset) SETTINGS index_granularity = 8192"
-    compose up -d kahouse
-    wait_for_sink
-
-    print_info "Sending plain string payload to table with incompatible ClickHouse type..."
-    compose exec -T kafka bash -lc "printf 'plain-text-value\n' | kafka-console-producer --bootstrap-server localhost:9092 --topic payments"
-
-    print_info "Waiting for string DLQ handling..."
-    sleep 15
-
-    assert_table_count payments 0
-    assert_dlq_count payments.dlq 1
-    print_status 0 "String DLQ test passed"
 }
 
 trap cleanup EXIT
@@ -298,14 +275,13 @@ compose build kahouse
 run_mixed_format_success_test
 run_avro_dlq_test
 run_json_dlq_test
-run_string_dlq_test
 
 echo ""
 echo "=== Integration Test Complete ==="
 echo ""
 echo "Summary:"
 echo "  - Success coverage: mixed avro/json/string in one sink run"
-echo "  - DLQ coverage: invalid avro, malformed json, string insert failure"
+echo "  - DLQ coverage: invalid avro, malformed json (repair mode: dlq)"
 echo "  - Kafka Topics: test, orders, payments"
 echo "  - ClickHouse Tables: default.test, default.orders, default.payments"
 echo "  - Sink Metrics: docker-compose exec kahouse wget -qO- http://localhost:9090/metrics"

@@ -72,6 +72,9 @@ type Config struct {
 	MaxRetries     *int `yaml:"max_retries"`
 	RetryBackoffMs *int `yaml:"retry_backoff_ms"`
 
+	// Shutdown timeout (seconds) for flushing remaining batches and stopping the HTTP server
+	ShutdownTimeoutS int `yaml:"shutdown_timeout_s"`
+
 	TopicTables []TopicTableMapping `yaml:"topic_tables"`
 }
 
@@ -156,6 +159,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.KafkaMaxPollIntervalMs == 0 {
 		cfg.KafkaMaxPollIntervalMs = 300000
+	}
+	if cfg.ShutdownTimeoutS == 0 {
+		cfg.ShutdownTimeoutS = 5
 	}
 }
 
@@ -256,6 +262,9 @@ func validateConfig(cfg *Config) error {
 	if cfg.KafkaMaxPollIntervalMs <= 0 {
 		return fmt.Errorf("kafka_max_poll_interval_ms must be > 0, got %d", cfg.KafkaMaxPollIntervalMs)
 	}
+	if cfg.ShutdownTimeoutS <= 0 {
+		return fmt.Errorf("shutdown_timeout_s must be > 0, got %d", cfg.ShutdownTimeoutS)
+	}
 	if len(cfg.TopicTables) == 0 {
 		return fmt.Errorf("at least one topic_tables mapping is required")
 	}
@@ -324,6 +333,7 @@ func configLogFields(cfg *Config) []interface{} {
 		"retry_backoff_ms", *cfg.RetryBackoffMs,
 		"kafka_session_timeout_ms", cfg.KafkaSessionTimeoutMs,
 		"kafka_max_poll_interval_ms", cfg.KafkaMaxPollIntervalMs,
+		"shutdown_timeout_s", cfg.ShutdownTimeoutS,
 		"topic_tables", cfg.TopicTables,
 	}
 }
