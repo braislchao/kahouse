@@ -31,7 +31,7 @@ func getColumnTypes(ctx context.Context, conn driver.Conn, table string) (map[st
 	if err != nil {
 		return nil, fmt.Errorf("query column types for %s: %w", table, err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	types := make(map[string]string)
 	for rows.Next() {
@@ -47,11 +47,6 @@ func getColumnTypes(ctx context.Context, conn driver.Conn, table string) (map[st
 
 	schemaCache.Store(table, types)
 	return types, nil
-}
-
-// resetSchemaCache clears the cached column types (used in tests).
-func resetSchemaCache() {
-	schemaCache = sync.Map{}
 }
 
 // stripTypeWrappers removes LowCardinality and Nullable wrappers from a ClickHouse type,
