@@ -94,11 +94,10 @@ type batchTiming struct {
 	Send    time.Duration
 }
 
-// writeBatch writes a batch of records to a ClickHouse table using the columnar API.
-// It fetches column types from the schema cache, transposes the row-oriented batch into
-// column-oriented typed slices, and appends them in bulk — eliminating per-row reflection
-// and interface dispatch overhead.
-func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool) (batchTiming, error) {
+// writeBatch writes a batch of records to a ClickHouse table. It uses the fast
+// columnar API when all column types are supported, and falls back to row-by-row
+// Append for tables with unsupported types (e.g. Array(Tuple(...))).
+func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool, sugar *zap.SugaredLogger) (batchTiming, error) {
 	var timing batchTiming
 	if len(batch) == 0 {
 		return timing, nil
@@ -144,6 +143,9 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 	}
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES", quotedTable, strings.Join(quoted, ", "))
 
+	// Decide insert strategy: columnar (fast) or row-by-row (fallback).
+	useColumnar := CanUseColumnar(table, colTypes)
+
 	prepareStart := time.Now()
 	batchStmt, err := chConn.PrepareBatch(ctx, insertSQL)
 	timing.Prepare = time.Since(prepareStart)
@@ -151,35 +153,55 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 		return timing, fmt.Errorf("failed to prepare batch insert: %w", err)
 	}
 
-	// Columnar append: transpose rows into column-oriented typed slices and append
-	// each column in bulk. This avoids per-row reflection, interface dispatch, and
-	// []interface{} allocation that dominates the row-by-row Append path.
-	appendStart := time.Now()
-	for i, col := range columns {
-		chType, ok := colTypes[col]
-		if !ok {
-			timing.Append = time.Since(appendStart)
-			return timing, fmt.Errorf("column %q not found in table %s schema", col, table)
-		}
+	if useColumnar {
+		// Columnar append: transpose rows into column-oriented typed slices and append
+		// each column in bulk. This avoids per-row reflection, interface dispatch, and
+		// []interface{} allocation that dominates the row-by-row Append path.
+		appendStart := time.Now()
+		for i, col := range columns {
+			chType, ok := colTypes[col]
+			if !ok {
+				timing.Append = time.Since(appendStart)
+				return timing, fmt.Errorf("column %q not found in table %s schema", col, table)
+			}
 
-		// Collect values for this column across all rows.
-		values := make([]interface{}, len(batch))
-		for j, record := range batch {
-			values[j] = record[col]
-		}
+			// Collect values for this column across all rows.
+			values := make([]interface{}, len(batch))
+			for j, record := range batch {
+				values[j] = record[col]
+			}
 
-		typedSlice, err := buildColumnSlice(chType, values)
-		if err != nil {
-			timing.Append = time.Since(appendStart)
-			return timing, fmt.Errorf("column %q (type %s): %w", col, chType, err)
-		}
+			typedSlice, err := buildColumnSlice(chType, values)
+			if err != nil {
+				timing.Append = time.Since(appendStart)
+				return timing, fmt.Errorf("column %q (type %s): %w", col, chType, err)
+			}
 
-		if err := batchStmt.Column(i).Append(typedSlice); err != nil {
-			timing.Append = time.Since(appendStart)
-			return timing, fmt.Errorf("failed to append column %q: %w", col, err)
+			if err := batchStmt.Column(i).Append(typedSlice); err != nil {
+				timing.Append = time.Since(appendStart)
+				return timing, fmt.Errorf("failed to append column %q: %w", col, err)
+			}
 		}
+		timing.Append = time.Since(appendStart)
+	} else {
+		// Row-by-row fallback for tables with unsupported column types.
+		// This is slower but correct for any type the driver supports natively.
+		if sugar != nil {
+			sugar.Warnf("Using row-by-row insert fallback for table %s (unsupported column types for columnar API)", table)
+		}
+		appendStart := time.Now()
+		for _, record := range batch {
+			row := make([]interface{}, len(columns))
+			for i, col := range columns {
+				row[i] = record[col]
+			}
+			if err := batchStmt.Append(row...); err != nil {
+				timing.Append = time.Since(appendStart)
+				return timing, fmt.Errorf("failed to append row: %w", err)
+			}
+		}
+		timing.Append = time.Since(appendStart)
 	}
-	timing.Append = time.Since(appendStart)
 
 	sendStart := time.Now()
 	if err := batchStmt.Send(); err != nil {

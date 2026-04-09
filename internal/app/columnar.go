@@ -13,6 +13,9 @@ import (
 // schemaCache stores column name→type maps keyed by table name.
 var schemaCache sync.Map
 
+// columnarCache stores per-table columnar eligibility (bool) so we only check once.
+var columnarCache sync.Map
+
 // getColumnTypes returns a map of column name → ClickHouse type for the given table.
 // Results are cached for the lifetime of the process.
 func getColumnTypes(ctx context.Context, conn driver.Conn, table string) (map[string]string, error) {
@@ -49,6 +52,25 @@ func getColumnTypes(ctx context.Context, conn driver.Conn, table string) (map[st
 	return types, nil
 }
 
+// CanUseColumnar checks whether all column types in the given type map are
+// supported by the columnar insert path. The result is cached per table name
+// so the check runs at most once per table per process lifetime.
+// Returns true if all types are supported, false if any type requires the
+// row-by-row fallback path.
+func CanUseColumnar(table string, colTypes map[string]string) bool {
+	if cached, ok := columnarCache.Load(table); ok {
+		return cached.(bool)
+	}
+	for _, chType := range colTypes {
+		if _, err := buildColumnSlice(chType, []interface{}{}); err != nil {
+			columnarCache.Store(table, false)
+			return false
+		}
+	}
+	columnarCache.Store(table, true)
+	return true
+}
+
 // stripTypeWrappers removes LowCardinality and Nullable wrappers from a ClickHouse type,
 // returning the base type and whether Nullable was present.
 func stripTypeWrappers(chType string) (baseType string, nullable bool) {
@@ -63,10 +85,33 @@ func stripTypeWrappers(chType string) (baseType string, nullable bool) {
 	return
 }
 
+// parseArrayInnerType extracts the inner type from "Array(T)".
+// Returns the inner type string and true if the type is an Array with a
+// supported primitive inner type. Returns ("", false) for non-Array types
+// or Arrays with complex inner types (e.g. Tuple, Nested, Map).
+func parseArrayInnerType(baseType string) (string, bool) {
+	if !strings.HasPrefix(baseType, "Array(") || !strings.HasSuffix(baseType, ")") {
+		return "", false
+	}
+	inner := baseType[6 : len(baseType)-1]
+	// Reject complex nested types that we cannot handle in columnar mode.
+	if strings.HasPrefix(inner, "Tuple(") || strings.HasPrefix(inner, "Nested(") ||
+		strings.HasPrefix(inner, "Map(") || strings.HasPrefix(inner, "Array(") {
+		return "", false
+	}
+	return inner, true
+}
+
 // buildColumnSlice converts a slice of interface{} values to a typed slice
 // matching the given ClickHouse column type, suitable for BatchColumn.Append.
 func buildColumnSlice(chType string, values []interface{}) (interface{}, error) {
 	baseType, nullable := stripTypeWrappers(chType)
+
+	// Handle Array types first — nullable doesn't apply to the array itself,
+	// only to the element type (which we handle inside buildArraySlice).
+	if innerType, ok := parseArrayInnerType(baseType); ok {
+		return buildArraySlice(innerType, values)
+	}
 
 	switch {
 	case baseType == "String" || strings.HasPrefix(baseType, "FixedString") ||
@@ -343,4 +388,85 @@ func toBool(v interface{}) (bool, error) {
 	default:
 		return false, fmt.Errorf("cannot convert %T to bool", v)
 	}
+}
+
+// buildArraySlice converts a column of array values (each row is a []interface{}
+// from JSON/Avro deserialization) into a typed [][]T suitable for columnar Append.
+// The innerType is the unwrapped element type (e.g. "UInt64" from "Array(UInt64)").
+// Nil row values produce nil inner slices (empty arrays in ClickHouse).
+func buildArraySlice(innerType string, values []interface{}) (interface{}, error) {
+	// Strip wrappers from the inner type (e.g. Array(Nullable(String)) is not
+	// supported in columnar mode and would not reach here — parseArrayInnerType
+	// rejects complex inners — but handle LowCardinality just in case).
+	baseInner, _ := stripTypeWrappers(innerType)
+
+	switch {
+	case baseInner == "String" || strings.HasPrefix(baseInner, "FixedString") ||
+		baseInner == "UUID" || strings.HasPrefix(baseInner, "Enum8") ||
+		strings.HasPrefix(baseInner, "Enum16"):
+		return buildTypedArraySlice(values, toString)
+
+	case baseInner == "Int8":
+		return buildTypedArraySlice(values, toInt8)
+	case baseInner == "Int16":
+		return buildTypedArraySlice(values, toInt16)
+	case baseInner == "Int32":
+		return buildTypedArraySlice(values, toInt32)
+	case baseInner == "Int64":
+		return buildTypedArraySlice(values, toInt64)
+
+	case baseInner == "UInt8":
+		return buildTypedArraySlice(values, toUint8)
+	case baseInner == "UInt16":
+		return buildTypedArraySlice(values, toUint16)
+	case baseInner == "UInt32":
+		return buildTypedArraySlice(values, toUint32)
+	case baseInner == "UInt64":
+		return buildTypedArraySlice(values, toUint64)
+
+	case baseInner == "Float32":
+		return buildTypedArraySlice(values, toFloat32)
+	case baseInner == "Float64":
+		return buildTypedArraySlice(values, toFloat64)
+
+	case strings.HasPrefix(baseInner, "DateTime64") || baseInner == "DateTime" ||
+		baseInner == "Date" || baseInner == "Date32":
+		return buildTypedArraySlice(values, toTime)
+
+	case baseInner == "Bool":
+		return buildTypedArraySlice(values, toBool)
+
+	default:
+		return nil, fmt.Errorf("unsupported Array inner type %q for columnar insert", innerType)
+	}
+}
+
+// buildTypedArraySlice converts []interface{} (where each element is itself a
+// []interface{} or nil) into [][]T. Each inner []interface{} is converted
+// element-by-element using the provided converter function.
+func buildTypedArraySlice[T any](values []interface{}, convert func(interface{}) (T, error)) ([][]T, error) {
+	out := make([][]T, len(values))
+	for i, v := range values {
+		if v == nil {
+			// nil → nil slice, which ClickHouse treats as an empty array
+			continue
+		}
+		arr, ok := v.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("row %d: expected []interface{} for array column, got %T", i, v)
+		}
+		inner := make([]T, len(arr))
+		for j, elem := range arr {
+			if elem == nil {
+				continue // zero value of T
+			}
+			val, err := convert(elem)
+			if err != nil {
+				return nil, fmt.Errorf("row %d, element %d: %w", i, j, err)
+			}
+			inner[j] = val
+		}
+		out[i] = inner
+	}
+	return out, nil
 }

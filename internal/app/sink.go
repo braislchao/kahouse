@@ -180,8 +180,8 @@ func (t *SinkTask) Run(ctx context.Context) {
 		if err != nil {
 			if kafkaErr, ok := err.(kafka.Error); ok {
 				switch kafkaErr.Code() {
-			case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
-				// Check if the batch delay has expired.
+				case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
+					// Check if the batch delay has expired.
 					if len(batch) > 0 && time.Since(firstInBatch) >= batchDelay {
 						t.sugar.Infof("Batch delay reached (%d messages), flushing", len(batch))
 						if !t.flush(table, batch, firstInBatch) {
@@ -350,7 +350,7 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, wait)
 		}
 		var writeErr error
-		timing, writeErr = writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert)
+		timing, writeErr = writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert, t.sugar)
 		if writeErr != nil {
 			if !isRetriableClickHouseError(writeErr) {
 				t.sugar.Errorf("Non-retriable ClickHouse error, skipping retries: %v", writeErr)

@@ -213,7 +213,7 @@ func TestBuildColumnSliceLowCardinalityNullable(t *testing.T) {
 }
 
 func TestBuildColumnSliceUnsupportedType(t *testing.T) {
-	_, err := buildColumnSlice("Array(String)", []interface{}{})
+	_, err := buildColumnSlice("Array(Tuple(UInt64, String))", []interface{}{})
 	if err == nil {
 		t.Error("expected error for unsupported type")
 	}
@@ -314,5 +314,233 @@ func TestEmptyBatch(t *testing.T) {
 	got := result.([]string)
 	if len(got) != 0 {
 		t.Errorf("expected empty slice, got %v", got)
+	}
+}
+
+func TestBuildColumnSliceArrayUInt64(t *testing.T) {
+	values := []interface{}{
+		[]interface{}{uint64(1), uint64(2), uint64(3)},
+		[]interface{}{int64(10), int64(20)}, // JSON decoder produces int64
+		nil,                                 // nil row → nil/empty array
+	}
+
+	result, err := buildColumnSlice("Array(UInt64)", values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.([][]uint64)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(got))
+	}
+	if len(got[0]) != 3 || got[0][0] != 1 || got[0][1] != 2 || got[0][2] != 3 {
+		t.Errorf("row 0: unexpected %v", got[0])
+	}
+	if len(got[1]) != 2 || got[1][0] != 10 || got[1][1] != 20 {
+		t.Errorf("row 1: unexpected %v", got[1])
+	}
+	if got[2] != nil {
+		t.Errorf("row 2: expected nil, got %v", got[2])
+	}
+}
+
+func TestBuildColumnSliceArrayString(t *testing.T) {
+	values := []interface{}{
+		[]interface{}{"hello", "world"},
+		[]interface{}{}, // empty array
+		nil,             // nil → nil slice
+	}
+
+	result, err := buildColumnSlice("Array(String)", values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.([][]string)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(got))
+	}
+	if len(got[0]) != 2 || got[0][0] != "hello" || got[0][1] != "world" {
+		t.Errorf("row 0: unexpected %v", got[0])
+	}
+	if len(got[1]) != 0 {
+		t.Errorf("row 1: expected empty, got %v", got[1])
+	}
+	if got[2] != nil {
+		t.Errorf("row 2: expected nil, got %v", got[2])
+	}
+}
+
+func TestBuildColumnSliceArrayInt64(t *testing.T) {
+	values := []interface{}{
+		[]interface{}{int64(-1), int64(0), int64(42)},
+	}
+
+	result, err := buildColumnSlice("Array(Int64)", values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.([][]int64)
+	if len(got[0]) != 3 || got[0][0] != -1 || got[0][1] != 0 || got[0][2] != 42 {
+		t.Errorf("unexpected %v", got[0])
+	}
+}
+
+func TestBuildColumnSliceArrayFloat64(t *testing.T) {
+	values := []interface{}{
+		[]interface{}{float64(1.5), float64(2.5)},
+	}
+
+	result, err := buildColumnSlice("Array(Float64)", values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.([][]float64)
+	if got[0][0] != 1.5 || got[0][1] != 2.5 {
+		t.Errorf("unexpected %v", got[0])
+	}
+}
+
+func TestBuildColumnSliceArrayBadElementType(t *testing.T) {
+	// Pass a struct inside the array — should fail conversion.
+	values := []interface{}{
+		[]interface{}{struct{}{}},
+	}
+	_, err := buildColumnSlice("Array(UInt64)", values)
+	if err == nil {
+		t.Error("expected error for unconvertible array element")
+	}
+}
+
+func TestBuildColumnSliceArrayBadRowType(t *testing.T) {
+	// Pass a non-slice value where []interface{} is expected.
+	values := []interface{}{"not-an-array"}
+	_, err := buildColumnSlice("Array(UInt64)", values)
+	if err == nil {
+		t.Error("expected error for non-array row value")
+	}
+}
+
+func TestBuildColumnSliceArrayTupleUnsupported(t *testing.T) {
+	_, err := buildColumnSlice("Array(Tuple(UInt64, String, Float64))", []interface{}{})
+	if err == nil {
+		t.Error("expected error for Array(Tuple(...)) type")
+	}
+}
+
+// --- DateTime64 with timezone tests ---
+
+func TestBuildColumnSliceDateTime64WithTimezone(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	values := []interface{}{now, nil}
+
+	// DateTime64(3, 'UTC') — the HasPrefix("DateTime64") match should handle this.
+	result, err := buildColumnSlice("DateTime64(3, 'UTC')", values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.([]time.Time)
+	if !got[0].Equal(now) {
+		t.Errorf("got %v, want %v", got[0], now)
+	}
+	if !got[1].IsZero() {
+		t.Errorf("expected zero time for nil, got %v", got[1])
+	}
+}
+
+func TestBuildColumnSliceNullableDateTime64WithTimezone(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	values := []interface{}{now, nil}
+
+	result, err := buildColumnSlice("Nullable(DateTime64(3, 'UTC'))", values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.([]*time.Time)
+	if !got[0].Equal(now) {
+		t.Errorf("got %v, want %v", *got[0], now)
+	}
+	if got[1] != nil {
+		t.Errorf("expected nil for null, got %v", got[1])
+	}
+}
+
+// --- parseArrayInnerType tests ---
+
+func TestParseArrayInnerType(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantInner string
+		wantOK    bool
+	}{
+		{"Array(UInt64)", "UInt64", true},
+		{"Array(String)", "String", true},
+		{"Array(Int64)", "Int64", true},
+		{"Array(Float64)", "Float64", true},
+		{"Array(DateTime64(3))", "DateTime64(3)", true},
+		// Complex types rejected:
+		{"Array(Tuple(UInt64, String))", "", false},
+		{"Array(Nested(x UInt64))", "", false},
+		{"Array(Map(String, UInt64))", "", false},
+		{"Array(Array(UInt64))", "", false},
+		// Non-array types:
+		{"String", "", false},
+		{"UInt64", "", false},
+		{"Nullable(String)", "", false},
+	}
+	for _, tt := range tests {
+		inner, ok := parseArrayInnerType(tt.input)
+		if inner != tt.wantInner || ok != tt.wantOK {
+			t.Errorf("parseArrayInnerType(%q) = (%q, %v), want (%q, %v)",
+				tt.input, inner, ok, tt.wantInner, tt.wantOK)
+		}
+	}
+}
+
+// --- CanUseColumnar tests ---
+
+func TestCanUseColumnarAllSupported(t *testing.T) {
+	// Clear cache to avoid interference from other tests.
+	columnarCache.Delete("test_supported")
+
+	colTypes := map[string]string{
+		"id":         "UInt64",
+		"name":       "String",
+		"created_at": "DateTime64(3)",
+		"tags":       "Array(String)",
+		"active":     "Nullable(Bool)",
+		"score":      "Float64",
+	}
+	if !CanUseColumnar("test_supported", colTypes) {
+		t.Error("expected CanUseColumnar to return true for all supported types")
+	}
+}
+
+func TestCanUseColumnarWithUnsupportedType(t *testing.T) {
+	columnarCache.Delete("test_unsupported")
+
+	colTypes := map[string]string{
+		"id":     "UInt64",
+		"name":   "String",
+		"nested": "Array(Tuple(UInt64, String, Float64))",
+	}
+	if CanUseColumnar("test_unsupported", colTypes) {
+		t.Error("expected CanUseColumnar to return false when Array(Tuple(...)) is present")
+	}
+}
+
+func TestCanUseColumnarCaching(t *testing.T) {
+	columnarCache.Delete("test_cache")
+
+	colTypes := map[string]string{"id": "UInt64"}
+
+	// First call computes and caches.
+	result1 := CanUseColumnar("test_cache", colTypes)
+	// Second call should hit cache — even with different colTypes, cache wins.
+	result2 := CanUseColumnar("test_cache", map[string]string{"bad": "Array(Tuple(X))"})
+
+	if result1 != true {
+		t.Error("first call should return true")
+	}
+	if result2 != true {
+		t.Error("second call should return cached true, not recompute")
 	}
 }
