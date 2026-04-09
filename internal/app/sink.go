@@ -169,10 +169,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 		case <-ctx.Done():
 			t.sugar.Info("Context closed, flushing remaining batch")
 			if len(batch) > 0 {
-				// Use a bounded context for the final flush so we don't block shutdown indefinitely.
-				flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				t.flush(flushCtx, table, batch, firstInBatch)
-				flushCancel()
+				t.flush(table, batch, firstInBatch)
 			}
 			return
 		default:
@@ -183,11 +180,11 @@ func (t *SinkTask) Run(ctx context.Context) {
 		if err != nil {
 			if kafkaErr, ok := err.(kafka.Error); ok {
 				switch kafkaErr.Code() {
-			case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
-				// Check if the batch delay has expired.
+				case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
+					// Check if the batch delay has expired.
 					if len(batch) > 0 && time.Since(firstInBatch) >= batchDelay {
 						t.sugar.Infof("Batch delay reached (%d messages), flushing", len(batch))
-						if !t.flush(ctx, table, batch, firstInBatch) {
+						if !t.flush(table, batch, firstInBatch) {
 							return
 						}
 						batch = nil
@@ -248,7 +245,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 
 		if len(batch) >= batchSize {
 			t.sugar.Infof("Batch size reached (%d), flushing", len(batch))
-			if !t.flush(ctx, table, batch, firstInBatch) {
+			if !t.flush(table, batch, firstInBatch) {
 				return
 			}
 			batch = nil
@@ -259,7 +256,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 
 // flush writes the batch to ClickHouse with retries and commits offsets.
 // Returns true on success, false on failure (caller should stop).
-func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]interface{}, firstInBatch time.Time) bool {
+func (t *SinkTask) flush(table string, batch []map[string]interface{}, firstInBatch time.Time) bool {
 	topic := t.mapping.Topic
 	flushStart := time.Now()
 	t.sugar.Infow("Flushing batch",
@@ -267,7 +264,9 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 		"batch_age_ms", time.Since(firstInBatch).Milliseconds(),
 	)
 
-	flushCtx, flushCancel := context.WithTimeout(ctx, 30*time.Second)
+	// Use context.Background so an in-flight flush is not killed by shutdown signal.
+	// The 30s timeout is the safety bound.
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer flushCancel()
 
 	writeStart := time.Now()
@@ -351,7 +350,7 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, wait)
 		}
 		var writeErr error
-		timing, writeErr = writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert)
+		timing, writeErr = writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert, t.sugar)
 		if writeErr != nil {
 			if !isRetriableClickHouseError(writeErr) {
 				t.sugar.Errorf("Non-retriable ClickHouse error, skipping retries: %v", writeErr)
