@@ -94,7 +94,10 @@ type batchTiming struct {
 	Send    time.Duration
 }
 
-// writeBatch writes a batch of records to a ClickHouse table.
+// writeBatch writes a batch of records to a ClickHouse table using the columnar API.
+// It fetches column types from the schema cache, transposes the row-oriented batch into
+// column-oriented typed slices, and appends them in bulk — eliminating per-row reflection
+// and interface dispatch overhead.
 func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool) (batchTiming, error) {
 	var timing batchTiming
 	if len(batch) == 0 {
@@ -114,6 +117,12 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 		columns = append(columns, k)
 	}
 	sort.Strings(columns)
+
+	// Fetch column types for the columnar code path.
+	colTypes, err := getColumnTypes(ctx, chConn, table)
+	if err != nil {
+		return timing, fmt.Errorf("failed to get column types for %s: %w", table, err)
+	}
 
 	quoted := make([]string, len(columns))
 	for i, col := range columns {
@@ -142,16 +151,32 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 		return timing, fmt.Errorf("failed to prepare batch insert: %w", err)
 	}
 
-	// Append expects all column values for a single row in one variadic call.
+	// Columnar append: transpose rows into column-oriented typed slices and append
+	// each column in bulk. This avoids per-row reflection, interface dispatch, and
+	// []interface{} allocation that dominates the row-by-row Append path.
 	appendStart := time.Now()
-	for _, record := range batch {
-		row := make([]interface{}, len(columns))
-		for i, col := range columns {
-			row[i] = record[col]
-		}
-		if err := batchStmt.Append(row...); err != nil {
+	for i, col := range columns {
+		chType, ok := colTypes[col]
+		if !ok {
 			timing.Append = time.Since(appendStart)
-			return timing, fmt.Errorf("failed to append row to batch: %w", err)
+			return timing, fmt.Errorf("column %q not found in table %s schema", col, table)
+		}
+
+		// Collect values for this column across all rows.
+		values := make([]interface{}, len(batch))
+		for j, record := range batch {
+			values[j] = record[col]
+		}
+
+		typedSlice, err := buildColumnSlice(chType, values)
+		if err != nil {
+			timing.Append = time.Since(appendStart)
+			return timing, fmt.Errorf("column %q (type %s): %w", col, chType, err)
+		}
+
+		if err := batchStmt.Column(i).Append(typedSlice); err != nil {
+			timing.Append = time.Since(appendStart)
+			return timing, fmt.Errorf("failed to append column %q: %w", col, err)
 		}
 	}
 	timing.Append = time.Since(appendStart)

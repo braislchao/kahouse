@@ -78,6 +78,9 @@ func Run() {
 	}
 	chOptions.MaxOpenConns = cfg.ClickHouseMaxOpenConns
 	chOptions.MaxIdleConns = cfg.ClickHouseMaxIdleConns
+	chOptions.Compression = &clickhouse.Compression{
+		Method: clickhouse.CompressionLZ4,
+	}
 	chConn, err := clickhouse.Open(chOptions)
 	if err != nil {
 		sugar.Errorf("Failed to open ClickHouse connection: %v", err)
