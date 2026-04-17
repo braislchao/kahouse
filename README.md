@@ -92,6 +92,65 @@ For `Nullable` Avro fields, use `Nullable(T)` column types. For sparse JSON (whe
 
 Async inserts are disabled by default (opt-in). Enable them with `clickhouse_async_insert: true` and optionally `clickhouse_wait_for_async_insert: true` in the config file.
 
+### Kafka metadata columns (optional)
+
+Inject Kafka message metadata (offset, partition, topic, timestamp, key,
+headers) as extra columns on each row before it is written to ClickHouse. This
+gives parity with the `InsertField$Value` SMT used by Kafka Connect sinks.
+
+Enable per topic by adding a `kafka_metadata:` block. Each subfield is
+optional — omit a field to skip injecting it. Column names are free-form and
+must exist in the target ClickHouse table.
+
+```yaml
+topic_tables:
+  - topic: "azure_events"
+    table: "default.kahouse_azure_events"
+    format: "json"
+    kafka_metadata:
+      offset:    "__offset"
+      partition: "__partition"
+      topic:     "__topic"
+      timestamp: "__timestamp"
+      key:       "__key"
+      headers:   "__headers"
+```
+
+| Field       | Kafka source                   | Go type             | Recommended ClickHouse column type            |
+|-------------|--------------------------------|---------------------|-----------------------------------------------|
+| `offset`    | `msg.TopicPartition.Offset`    | `int64`             | `UInt64` or `Int64`                           |
+| `partition` | `msg.TopicPartition.Partition` | `int32`             | `UInt32`, `Int32`, or `UInt64`                |
+| `topic`     | `*msg.TopicPartition.Topic`    | `string`            | `LowCardinality(String)` or `String`          |
+| `timestamp` | `msg.Timestamp`                | `time.Time`         | `DateTime64(3)` or `Nullable(DateTime64(3))`  |
+| `key`       | `msg.Key` (raw bytes)          | `string`            | `String` (or `FixedString(N)` for fixed keys) |
+| `headers`   | `msg.Headers`                  | `map[string]string` | `Map(String, String)` (last-wins on dup keys) |
+
+Sample matching table:
+
+```sql
+CREATE TABLE default.kahouse_azure_events (
+    -- payload columns
+    event_id     String,
+    user_id      Int64,
+    payload      String,
+    -- kafka metadata
+    __offset     UInt64,
+    __partition  UInt32,
+    __topic      LowCardinality(String),
+    __timestamp  DateTime64(3),
+    __key        String,
+    __headers    Map(String, String)
+) ENGINE = MergeTree()
+ORDER BY (__partition, __offset)
+```
+
+**Collision handling:** if a decoded record already contains a key matching a
+metadata column name, the metadata value wins and a warning is logged once per
+column per task.
+
+A standalone, feature-focused example lives at
+[`docs/examples/kafka-metadata.yaml`](docs/examples/kafka-metadata.yaml).
+
 ## Error handling
 
 Write failures are retried with exponential backoff. If all retries are exhausted, the task stops. Since Kafka retains messages, restarting the task replays from the last committed offset.
@@ -193,6 +252,19 @@ go test ./...
 # Integration tests (starts all deps via Docker Compose)
 ./scripts/test-integration.sh
 ```
+
+## Release notes
+
+### Unreleased
+
+- **Added — Kafka metadata injection.** New optional `kafka_metadata:` block
+  on each `topic_tables` entry enriches rows with Kafka message metadata
+  (`offset`, `partition`, `topic`, `timestamp`, `key`, `headers`) before
+  insert. Achieves parity with Kafka Connect's `InsertField$Value` SMT. See
+  the [Kafka metadata columns](#kafka-metadata-columns-optional) section.
+  Fully backward compatible: omitting the block preserves previous behavior.
+- **Added —** standalone example config at
+  [`docs/examples/kafka-metadata.yaml`](docs/examples/kafka-metadata.yaml).
 
 ## License
 

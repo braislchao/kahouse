@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -1599,5 +1600,163 @@ func TestSanitizeDSN(t *testing.T) {
 				t.Errorf("sanitizeDSN(%q)\n got  %q\n want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestKafkaMetadataMappingIsEmpty(t *testing.T) {
+	if !(*KafkaMetadataMapping)(nil).IsEmpty() {
+		t.Fatal("nil mapping should be empty")
+	}
+	if !(&KafkaMetadataMapping{}).IsEmpty() {
+		t.Fatal("zero-value mapping should be empty")
+	}
+	if (&KafkaMetadataMapping{Offset: "__offset"}).IsEmpty() {
+		t.Fatal("mapping with offset set should not be empty")
+	}
+}
+
+func TestTopicTableMappingResolveTrimsKafkaMetadata(t *testing.T) {
+	cfg := &Config{
+		BatchSize:      1,
+		BatchDelayMs:   intPtr(1),
+		MaxRetries:     intPtr(1),
+		RetryBackoffMs: intPtr(1),
+	}
+	mapping := TopicTableMapping{
+		Topic: "t",
+		Table: "default.t",
+		KafkaMetadata: &KafkaMetadataMapping{
+			Offset:    "  __offset  ",
+			Partition: "__partition",
+			Topic:     "",
+			Timestamp: "   ", // whitespace-only → treated as omitted after trim
+			Key:       "__key",
+			Headers:   "__headers",
+		},
+	}
+	mapping.resolve(cfg)
+	if mapping.KafkaMetadata.Offset != "__offset" {
+		t.Errorf("Offset not trimmed: got %q", mapping.KafkaMetadata.Offset)
+	}
+	if mapping.KafkaMetadata.Timestamp != "" {
+		t.Errorf("whitespace-only Timestamp should resolve to empty, got %q", mapping.KafkaMetadata.Timestamp)
+	}
+}
+
+func TestValidateConfigKafkaMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string // substring; empty means expect success
+	}{
+		{
+			name:   "absent block is valid",
+			mutate: func(c *Config) {},
+		},
+		{
+			name: "full block is valid",
+			mutate: func(c *Config) {
+				c.TopicTables[0].KafkaMetadata = &KafkaMetadataMapping{
+					Offset: "__offset", Partition: "__partition", Topic: "__topic",
+					Timestamp: "__ts", Key: "__key", Headers: "__headers",
+				}
+			},
+		},
+		{
+			name: "partial block is valid",
+			mutate: func(c *Config) {
+				c.TopicTables[0].KafkaMetadata = &KafkaMetadataMapping{Offset: "__offset", Topic: "__topic"}
+			},
+		},
+		{
+			name: "empty block is valid (no columns configured)",
+			mutate: func(c *Config) {
+				c.TopicTables[0].KafkaMetadata = &KafkaMetadataMapping{}
+			},
+		},
+		{
+			name: "duplicate column names rejected",
+			mutate: func(c *Config) {
+				c.TopicTables[0].KafkaMetadata = &KafkaMetadataMapping{Offset: "x", Partition: "x"}
+			},
+			wantErr: "duplicate column name",
+		},
+		{
+			name: "whitespace-only value treated as unset, no error",
+			mutate: func(c *Config) {
+				c.TopicTables[0].KafkaMetadata = &KafkaMetadataMapping{Offset: "   "}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			for i := range cfg.TopicTables {
+				cfg.TopicTables[i].resolve(&cfg)
+			}
+			err := validateConfig(&cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestLoadConfigParsesKafkaMetadata(t *testing.T) {
+	yaml := `
+kafka_brokers: "localhost:9092"
+schema_registry: "http://localhost:8081"
+clickhouse_dsn: "tcp://localhost:9000"
+group_id: "kahouse"
+input_format: "json"
+dlq_topic_suffix: ".dlq"
+topic_tables:
+  - topic: "with_metadata"
+    table: "default.with_metadata"
+    format: "json"
+    kafka_metadata:
+      offset:    "__offset"
+      partition: "__partition"
+      topic:     "__topic"
+      timestamp: "__timestamp"
+      key:       "__key"
+      headers:   "__headers"
+  - topic: "without_metadata"
+    table: "default.without_metadata"
+    format: "json"
+`
+	dir := t.TempDir()
+	path := dir + "/kahouse.yaml"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig failed: %v", err)
+	}
+	if len(cfg.TopicTables) != 2 {
+		t.Fatalf("expected 2 topic_tables, got %d", len(cfg.TopicTables))
+	}
+	m := cfg.TopicTables[0].KafkaMetadata
+	if m == nil {
+		t.Fatal("expected KafkaMetadata to be parsed on first topic")
+	}
+	if m.Offset != "__offset" || m.Partition != "__partition" || m.Topic != "__topic" ||
+		m.Timestamp != "__timestamp" || m.Key != "__key" || m.Headers != "__headers" {
+		t.Fatalf("unexpected metadata mapping: %+v", m)
+	}
+	if cfg.TopicTables[1].KafkaMetadata != nil {
+		t.Fatalf("expected nil metadata on second topic, got %+v", cfg.TopicTables[1].KafkaMetadata)
 	}
 }

@@ -111,6 +111,46 @@ Every field below is optional. When omitted, the value is inherited from the cor
 | `batch_delay_ms` | int | `batch_delay_ms` |
 | `max_retries` | int | `max_retries` |
 | `retry_backoff_ms` | int | `retry_backoff_ms` |
+| `kafka_metadata` | object | *(none — opt-in, see below)* |
+
+### kafka_metadata
+
+Optional per-topic block that injects Kafka message metadata as extra columns
+on each row before it is written to ClickHouse. Gives parity with the Kafka
+Connect `InsertField$Value` SMT.
+
+All subfields are optional: an omitted (or whitespace-only) field is not
+injected. Column names are free-form and must exist in the target ClickHouse
+table.
+
+| Subfield | Kafka source | Go type | Recommended ClickHouse column type |
+|----------|--------------|---------|-------------------------------------|
+| `offset` | `msg.TopicPartition.Offset` | `int64` | `UInt64` or `Int64` |
+| `partition` | `msg.TopicPartition.Partition` | `int32` | `UInt32`, `Int32`, or `UInt64` |
+| `topic` | `*msg.TopicPartition.Topic` | `string` | `LowCardinality(String)` or `String` |
+| `timestamp` | `msg.Timestamp` | `time.Time` | `DateTime64(3)` or `Nullable(DateTime64(3))` |
+| `key` | `msg.Key` (raw bytes) | `string` | `String` or `FixedString(N)` |
+| `headers` | `msg.Headers` | `map[string]string` | `Map(String, String)` |
+
+Collision: if the decoded record already contains a key matching a configured
+metadata column, the metadata value wins and a warning is logged once per
+column per task.
+
+Example:
+
+```yaml
+topic_tables:
+  - topic: "azure_events"
+    table: "default.kahouse_azure_events"
+    format: "json"
+    kafka_metadata:
+      offset:    "__offset"
+      partition: "__partition"
+      topic:     "__topic"
+      timestamp: "__timestamp"
+      key:       "__key"
+      headers:   "__headers"
+```
 
 Example with overrides:
 
@@ -196,3 +236,4 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `topic_tables` must have at least one entry.
 - Each topic must have a non-empty `topic` and `table`.
 - Topic names must be unique -- duplicates are rejected.
+- Within a single topic's `kafka_metadata` block, column names must be unique across the six subfields.
