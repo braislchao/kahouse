@@ -79,8 +79,8 @@ topic_tables:
   # Equivalent to Kafka Connect's InsertField$Value SMT. Each field is optional:
   # omit a field to skip injecting it. Column names are free-form and must
   # exist in the target ClickHouse table.
-  - topic: "azure_events"
-    table: "default.kahouse_azure_events"
+  - topic: "orders_enriched"
+    table: "default.orders_enriched"
     format: "json"
     kafka_metadata:
       offset:    "__offset"     # int64  -> UInt64 or Int64

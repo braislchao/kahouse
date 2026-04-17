@@ -22,7 +22,7 @@ topic_tables:
   #
   # Example target table:
   #
-  #   CREATE TABLE default.kahouse_azure_events (
+  #   CREATE TABLE default.events_enriched (
   #       event_id     String,
   #       user_id      Int64,
   #       payload      String,
@@ -34,8 +34,8 @@ topic_tables:
   #       __headers    Map(String, String)
   #   ) ENGINE = MergeTree()
   #   ORDER BY (__partition, __offset);
-  - topic: "azure_events"
-    table: "default.kahouse_azure_events"
+  - topic: "events"
+    table: "default.events_enriched"
     format: "json"
     kafka_metadata:
       offset:    "__offset"
