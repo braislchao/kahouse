@@ -140,8 +140,8 @@ Example:
 
 ```yaml
 topic_tables:
-  - topic: "azure_events"
-    table: "default.kahouse_azure_events"
+  - topic: "orders"
+    table: "default.orders_enriched"
     format: "json"
     kafka_metadata:
       offset:    "__offset"
