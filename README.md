@@ -94,13 +94,7 @@ Async inserts are disabled by default (opt-in). Enable them with `clickhouse_asy
 
 ### Kafka metadata columns (optional)
 
-Inject Kafka message metadata (offset, partition, topic, timestamp, key,
-headers) as extra columns on each row before it is written to ClickHouse. This
-gives parity with the `InsertField$Value` SMT used by Kafka Connect sinks.
-
-Enable per topic by adding a `kafka_metadata:` block. Each subfield is
-optional — omit a field to skip injecting it. Column names are free-form and
-must exist in the target ClickHouse table.
+Inject Kafka message metadata as extra columns on each row. Enable per topic by adding a `kafka_metadata:` block — each subfield is optional, and column names must exist in the target table.
 
 ```yaml
 topic_tables:
@@ -108,48 +102,15 @@ topic_tables:
     table: "default.kahouse_azure_events"
     format: "json"
     kafka_metadata:
-      offset:    "__offset"
-      partition: "__partition"
-      topic:     "__topic"
-      timestamp: "__timestamp"
-      key:       "__key"
-      headers:   "__headers"
+      offset:    "__offset"     # int64             -> UInt64 / Int64
+      partition: "__partition"  # int32             -> UInt32 / Int32
+      topic:     "__topic"      # string            -> LowCardinality(String)
+      timestamp: "__timestamp"  # time.Time         -> DateTime64(3)
+      key:       "__key"        # string (raw bytes)-> String
+      headers:   "__headers"    # map[string]string -> Map(String, String)
 ```
 
-| Field       | Kafka source                   | Go type             | Recommended ClickHouse column type            |
-|-------------|--------------------------------|---------------------|-----------------------------------------------|
-| `offset`    | `msg.TopicPartition.Offset`    | `int64`             | `UInt64` or `Int64`                           |
-| `partition` | `msg.TopicPartition.Partition` | `int32`             | `UInt32`, `Int32`, or `UInt64`                |
-| `topic`     | `*msg.TopicPartition.Topic`    | `string`            | `LowCardinality(String)` or `String`          |
-| `timestamp` | `msg.Timestamp`                | `time.Time`         | `DateTime64(3)` or `Nullable(DateTime64(3))`  |
-| `key`       | `msg.Key` (raw bytes)          | `string`            | `String` (or `FixedString(N)` for fixed keys) |
-| `headers`   | `msg.Headers`                  | `map[string]string` | `Map(String, String)` (last-wins on dup keys) |
-
-Sample matching table:
-
-```sql
-CREATE TABLE default.kahouse_azure_events (
-    -- payload columns
-    event_id     String,
-    user_id      Int64,
-    payload      String,
-    -- kafka metadata
-    __offset     UInt64,
-    __partition  UInt32,
-    __topic      LowCardinality(String),
-    __timestamp  DateTime64(3),
-    __key        String,
-    __headers    Map(String, String)
-) ENGINE = MergeTree()
-ORDER BY (__partition, __offset)
-```
-
-**Collision handling:** if a decoded record already contains a key matching a
-metadata column name, the metadata value wins and a warning is logged once per
-column per task.
-
-A standalone, feature-focused example lives at
-[`docs/examples/kafka-metadata.yaml`](docs/examples/kafka-metadata.yaml).
+On collision with an existing record key, the metadata value wins and a warning is logged once per column. See [`docs/examples/kafka-metadata.yaml`](docs/examples/kafka-metadata.yaml) for a standalone example.
 
 ## Error handling
 
@@ -252,19 +213,6 @@ go test ./...
 # Integration tests (starts all deps via Docker Compose)
 ./scripts/test-integration.sh
 ```
-
-## Release notes
-
-### Unreleased
-
-- **Added — Kafka metadata injection.** New optional `kafka_metadata:` block
-  on each `topic_tables` entry enriches rows with Kafka message metadata
-  (`offset`, `partition`, `topic`, `timestamp`, `key`, `headers`) before
-  insert. Achieves parity with Kafka Connect's `InsertField$Value` SMT. See
-  the [Kafka metadata columns](#kafka-metadata-columns-optional) section.
-  Fully backward compatible: omitting the block preserves previous behavior.
-- **Added —** standalone example config at
-  [`docs/examples/kafka-metadata.yaml`](docs/examples/kafka-metadata.yaml).
 
 ## License
 
