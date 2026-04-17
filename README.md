@@ -92,6 +92,26 @@ For `Nullable` Avro fields, use `Nullable(T)` column types. For sparse JSON (whe
 
 Async inserts are disabled by default (opt-in). Enable them with `clickhouse_async_insert: true` and optionally `clickhouse_wait_for_async_insert: true` in the config file.
 
+### Kafka metadata columns (optional)
+
+Inject Kafka message metadata as extra columns on each row. Enable per topic by adding a `kafka_metadata:` block — each subfield is optional, and column names must exist in the target table.
+
+```yaml
+topic_tables:
+  - topic: "orders"
+    table: "default.orders_enriched"
+    format: "json"
+    kafka_metadata:
+      offset:    "__offset"     # int64             -> UInt64 / Int64
+      partition: "__partition"  # int32             -> UInt32 / Int32
+      topic:     "__topic"      # string            -> LowCardinality(String)
+      timestamp: "__timestamp"  # time.Time         -> DateTime64(3)
+      key:       "__key"        # string (raw bytes)-> String
+      headers:   "__headers"    # map[string]string -> Map(String, String)
+```
+
+On collision with an existing record key, the metadata value wins and a warning is logged once per column. See [`docs/examples/kafka-metadata.yaml`](docs/examples/kafka-metadata.yaml) for a standalone example.
+
 ## Error handling
 
 Write failures are retried with exponential backoff. If all retries are exhausted, the task stops. Since Kafka retains messages, restarting the task replays from the last committed offset.

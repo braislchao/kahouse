@@ -74,6 +74,22 @@ topic_tables:
     # max_retries: 0        # stop on first write failure, no retries
     # batch_delay_ms: 0     # flush as fast as possible, no accumulation delay
 
+  # Kafka metadata injection (optional, per-topic).
+  # Adds Kafka message metadata as extra columns on each row before insert.
+  # Equivalent to Kafka Connect's InsertField$Value SMT. Each field is optional:
+  # omit a field to skip injecting it. Column names are free-form and must
+  # exist in the target ClickHouse table.
+  - topic: "orders_enriched"
+    table: "default.orders_enriched"
+    format: "json"
+    kafka_metadata:
+      offset:    "__offset"     # int64  -> UInt64 or Int64
+      partition: "__partition"  # int32  -> UInt32, Int32, or UInt64
+      topic:     "__topic"      # string -> LowCardinality(String) or String
+      timestamp: "__timestamp"  # time.Time -> DateTime64(3) or Nullable(DateTime64(3))
+      key:       "__key"        # raw bytes as string -> String (or FixedString(N))
+      headers:   "__headers"    # map[string]string -> Map(String, String)
+
 # Input format notes:
 # - avro: ClickHouse columns should match the Avro schema fields.
 # - json: JSON objects are decoded generically; integers arrive as Int64 and decimals as Float64.
