@@ -1,0 +1,56 @@
+# kahouse — Kafka metadata injection example
+#
+# Minimal config demonstrating the `kafka_metadata` feature: Kafka message
+# metadata (offset, partition, topic, timestamp, key, headers) is injected as
+# extra columns on each row before it is written to ClickHouse.
+#
+# This gives parity with the Kafka Connect `InsertField$Value` SMT used by the
+# `connect-clickhouse` sink, without running a separate Connect cluster.
+#
+# Each subfield under `kafka_metadata` is optional: omit a field to skip
+# injecting it. Column names are free-form and must exist in the target
+# ClickHouse table.
+
+kafka_brokers: "localhost:9092"
+clickhouse_dsn: "tcp://localhost:9000"
+group_id: "kahouse"
+input_format: "json"
+dlq_topic_suffix: ".dlq"
+
+topic_tables:
+  # Full injection: all six metadata fields enabled.
+  #
+  # Example target table:
+  #
+  #   CREATE TABLE default.kahouse_azure_events (
+  #       event_id     String,
+  #       user_id      Int64,
+  #       payload      String,
+  #       __offset     UInt64,
+  #       __partition  UInt32,
+  #       __topic      LowCardinality(String),
+  #       __timestamp  DateTime64(3),
+  #       __key        String,
+  #       __headers    Map(String, String)
+  #   ) ENGINE = MergeTree()
+  #   ORDER BY (__partition, __offset);
+  - topic: "azure_events"
+    table: "default.kahouse_azure_events"
+    format: "json"
+    kafka_metadata:
+      offset:    "__offset"
+      partition: "__partition"
+      topic:     "__topic"
+      timestamp: "__timestamp"
+      key:       "__key"
+      headers:   "__headers"
+
+  # Partial injection: only offset + topic. Useful for the common
+  # Kafka-Connect-parity case where downstream tooling only cares about
+  # `__offset` for deduplication.
+  - topic: "orders"
+    table: "default.orders"
+    format: "json"
+    kafka_metadata:
+      offset: "__offset"
+      topic:  "__topic"

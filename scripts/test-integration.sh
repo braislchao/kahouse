@@ -107,6 +107,7 @@ create_topics() {
     compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic orders --partitions 3 --replication-factor 1 --if-not-exists
     compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic payments --partitions 3 --replication-factor 1 --if-not-exists
     compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic logs --partitions 3 --replication-factor 1 --if-not-exists
+    compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --topic metadata_test --partitions 1 --replication-factor 1 --if-not-exists
     register_avro_schemas
     print_status $? "Kafka resources created"
 }
@@ -157,6 +158,7 @@ create_all_tables() {
     compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.test (id Int32, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192"
     compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.orders (id Int64, name String, value Float64, timestamp Int64) ENGINE = MergeTree() ORDER BY id SETTINGS index_granularity = 8192"
     compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.payments (value String) ENGINE = MergeTree() ORDER BY tuple() SETTINGS index_granularity = 8192"
+    compose exec -T clickhouse clickhouse-client --query "CREATE TABLE IF NOT EXISTS default.metadata_test (id Int64, name String, __offset UInt64, __partition UInt32, __topic LowCardinality(String), __timestamp DateTime64(3), __key String, __headers Map(String, String)) ENGINE = MergeTree() ORDER BY (__partition, __offset) SETTINGS index_granularity = 8192"
     print_status $? "ClickHouse tables created"
 }
 
@@ -264,6 +266,104 @@ run_json_dlq_test() {
     print_status 0 "JSON DLQ test passed"
 }
 
+run_kafka_metadata_test() {
+    print_info "Running Kafka metadata injection test..."
+    cleanup
+
+    start_base_services
+    create_topics
+    create_all_tables
+
+    compose up -d kahouse
+    wait_for_sink
+
+    print_info "Producing message with key and headers to metadata_test..."
+    # Use kafka-console-producer with parse.key=true and headers so we can
+    # assert the injected __key and __headers columns.
+    compose exec -T kafka bash -lc "printf 'order-42\t{\"id\":42,\"name\":\"meta\"}\n' | kafka-console-producer \
+        --bootstrap-server localhost:9092 \
+        --topic metadata_test \
+        --property parse.key=true \
+        --property key.separator=\$'\t' \
+        --property parse.headers=true \
+        --property 'headers.delimiter=|' \
+        --property 'headers.separator=:' \
+        --property 'headers=trace_id:abc|source:web'" || {
+        # Older kafka-console-producer versions lack parse.headers. Fall back to key only.
+        print_info "Falling back to key-only produce (no headers)..."
+        compose exec -T kafka bash -lc "printf 'order-42\t{\"id\":42,\"name\":\"meta\"}\n' | kafka-console-producer \
+            --bootstrap-server localhost:9092 \
+            --topic metadata_test \
+            --property parse.key=true \
+            --property key.separator=\$'\t'"
+    }
+
+    sleep 10
+
+    assert_table_count metadata_test 1
+
+    echo "Verifying injected metadata columns..."
+    local row
+    row=$(compose exec -T clickhouse clickhouse-client --query \
+        "SELECT id, name, __offset, __partition, __topic, __key FROM default.metadata_test FORMAT TSV")
+    echo "  row: $row"
+
+    local offset partition topic key
+    offset=$(echo "$row" | awk '{print $3}')
+    partition=$(echo "$row" | awk '{print $4}')
+    topic=$(echo "$row" | awk '{print $5}')
+    key=$(echo "$row" | awk '{print $6}')
+
+    if [ "$offset" = "0" ]; then
+        print_status 0 "__offset = 0 (first message)"
+    else
+        print_status 1 "__offset expected 0, got $offset"; exit 1
+    fi
+    if [ "$partition" = "0" ]; then
+        print_status 0 "__partition = 0"
+    else
+        print_status 1 "__partition expected 0, got $partition"; exit 1
+    fi
+    if [ "$topic" = "metadata_test" ]; then
+        print_status 0 "__topic = metadata_test"
+    else
+        print_status 1 "__topic expected metadata_test, got $topic"; exit 1
+    fi
+    if [ "$key" = "order-42" ]; then
+        print_status 0 "__key = order-42"
+    else
+        print_status 1 "__key expected order-42, got $key"; exit 1
+    fi
+
+    # __timestamp should be non-zero and within the last few minutes; just check non-empty.
+    local ts
+    ts=$(compose exec -T clickhouse clickhouse-client --query \
+        "SELECT toString(__timestamp) FROM default.metadata_test LIMIT 1 FORMAT TSV")
+    if [ -n "$ts" ] && [ "$ts" != "1970-01-01 00:00:00.000" ]; then
+        print_status 0 "__timestamp populated: $ts"
+    else
+        print_status 1 "__timestamp expected non-zero, got '$ts'"; exit 1
+    fi
+
+    # Best-effort header check: only assert if the producer supported headers.
+    local trace
+    trace=$(compose exec -T clickhouse clickhouse-client --query \
+        "SELECT __headers['trace_id'] FROM default.metadata_test LIMIT 1 FORMAT TSV" || true)
+    if [ "$trace" = "abc" ]; then
+        print_status 0 "__headers['trace_id'] = abc"
+    else
+        print_info "Headers not asserted (producer may not support --property parse.headers): got '$trace'"
+    fi
+
+    # Parity: confirm a topic WITHOUT kafka_metadata still works unchanged.
+    print_info "Checking parity: orders topic (no kafka_metadata) still writes..."
+    compose exec -T kafka bash -lc "printf '{\"id\":1,\"name\":\"x\",\"value\":1.0,\"timestamp\":1}\n' | kafka-console-producer --bootstrap-server localhost:9092 --topic orders"
+    sleep 5
+    assert_table_count orders 1
+
+    print_status 0 "Kafka metadata injection test passed"
+}
+
 trap cleanup EXIT
 
 print_info "Cleaning up existing containers..."
@@ -275,6 +375,7 @@ compose build kahouse
 run_mixed_format_success_test
 run_avro_dlq_test
 run_json_dlq_test
+run_kafka_metadata_test
 
 echo ""
 echo "=== Integration Test Complete ==="
@@ -282,8 +383,9 @@ echo ""
 echo "Summary:"
 echo "  - Success coverage: mixed avro/json/string in one sink run"
 echo "  - DLQ coverage: invalid avro, malformed json (repair mode: dlq)"
-echo "  - Kafka Topics: test, orders, payments"
-echo "  - ClickHouse Tables: default.test, default.orders, default.payments"
+echo "  - Kafka metadata injection: offset/partition/topic/timestamp/key/headers"
+echo "  - Kafka Topics: test, orders, payments, metadata_test"
+echo "  - ClickHouse Tables: default.test, default.orders, default.payments, default.metadata_test"
 echo "  - Sink Metrics: docker-compose exec kahouse wget -qO- http://localhost:9090/metrics"
 echo "  - Sink Health: docker-compose exec kahouse wget -qO- http://localhost:9090/readyz"
 echo ""

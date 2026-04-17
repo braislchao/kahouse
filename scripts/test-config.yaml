@@ -23,3 +23,13 @@ topic_tables:
     table: "default.payments"
     format: "string"
     string_value_column: "value"
+  - topic: "metadata_test"
+    table: "default.metadata_test"
+    format: "json"
+    kafka_metadata:
+      offset:    "__offset"
+      partition: "__partition"
+      topic:     "__topic"
+      timestamp: "__timestamp"
+      key:       "__key"
+      headers:   "__headers"

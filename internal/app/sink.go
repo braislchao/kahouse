@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -58,19 +59,21 @@ func ParseRepairMode(s string) (RepairMode, error) {
 // Each task has its own lifecycle: when it encounters an unrecoverable error it stops
 // itself without affecting other tasks running in the same process.
 type SinkTask struct {
-	mapping            TopicTableMapping
-	dlqTopicSuffix     string
-	chConn             driver.Conn
-	decoder            MessageDecoder
-	dlqProducer        *kafka.Producer
-	consumer           *kafka.Consumer
-	sugar              *zap.SugaredLogger
-	stopped            atomic.Bool
-	stoppedByOperator  atomic.Bool
-	repairMode         atomic.Int32
-	asyncInsert        bool
-	waitForAsyncInsert bool
-	startAt            *StartAt
+	mapping                       TopicTableMapping
+	dlqTopicSuffix                string
+	chConn                        driver.Conn
+	decoder                       MessageDecoder
+	dlqProducer                   *kafka.Producer
+	consumer                      *kafka.Consumer
+	sugar                         *zap.SugaredLogger
+	stopped                       atomic.Bool
+	stoppedByOperator             atomic.Bool
+	repairMode                    atomic.Int32
+	asyncInsert                   bool
+	waitForAsyncInsert            bool
+	startAt                       *StartAt
+	metadataMapping               *KafkaMetadataMapping
+	metadataCollisionWarnedFields sync.Map // key: column name (string), value: struct{}
 }
 
 func (t *SinkTask) IsStopped() bool {
@@ -150,6 +153,7 @@ func NewSinkTask(
 		asyncInsert:        cfg.ClickHouseAsyncInsert,
 		waitForAsyncInsert: cfg.ClickHouseWaitForAsyncInsert,
 		startAt:            mapping.StartAt,
+		metadataMapping:    resolveMetadataMapping(mapping.KafkaMetadata),
 	}
 
 	if err := consumer.Subscribe(mapping.Topic, task.onRebalance); err != nil {
@@ -199,6 +203,16 @@ func (t *SinkTask) onRebalance(c *kafka.Consumer, ev kafka.Event) error {
 		return c.Unassign()
 	}
 	return nil
+}
+
+// resolveMetadataMapping returns nil if the mapping is unset or has no
+// configured columns; otherwise a copy of the provided mapping.
+func resolveMetadataMapping(m *KafkaMetadataMapping) *KafkaMetadataMapping {
+	if m.IsEmpty() {
+		return nil
+	}
+	cp := *m
+	return &cp
 }
 
 // Run reads messages from Kafka, accumulates them into batches, and flushes to ClickHouse.
@@ -304,6 +318,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 		if len(batch) == 0 {
 			firstInBatch = time.Now()
 		}
+		t.injectKafkaMetadata(record, msg)
 		batch = append(batch, record)
 
 		if len(batch) >= batchSize {
@@ -427,4 +442,54 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 		return attempt + 1, timing, nil
 	}
 	return 0, timing, fmt.Errorf("writeWithRetries: no attempts made (maxRetries=%d)", maxRetries)
+}
+
+// injectKafkaMetadata enriches the decoded record with Kafka message metadata
+// according to the task's kafka_metadata configuration. Fields with an empty
+// column name are skipped. On collision with an existing record key, the
+// metadata value overwrites the payload and a warning is logged at most once
+// per column per task.
+func (t *SinkTask) injectKafkaMetadata(record map[string]interface{}, msg *kafka.Message) {
+	m := t.metadataMapping
+	if m == nil || record == nil || msg == nil {
+		return
+	}
+
+	if m.Offset != "" {
+		t.setMetadataField(record, m.Offset, int64(msg.TopicPartition.Offset))
+	}
+	if m.Partition != "" {
+		t.setMetadataField(record, m.Partition, msg.TopicPartition.Partition)
+	}
+	if m.Topic != "" {
+		var topic string
+		if msg.TopicPartition.Topic != nil {
+			topic = *msg.TopicPartition.Topic
+		}
+		t.setMetadataField(record, m.Topic, topic)
+	}
+	if m.Timestamp != "" {
+		t.setMetadataField(record, m.Timestamp, msg.Timestamp)
+	}
+	if m.Key != "" {
+		t.setMetadataField(record, m.Key, string(msg.Key))
+	}
+	if m.Headers != "" {
+		headers := make(map[string]string, len(msg.Headers))
+		for _, h := range msg.Headers {
+			headers[h.Key] = string(h.Value)
+		}
+		t.setMetadataField(record, m.Headers, headers)
+	}
+}
+
+// setMetadataField writes val into record[col], logging a warning (once per
+// column) if col already existed in the record.
+func (t *SinkTask) setMetadataField(record map[string]interface{}, col string, val interface{}) {
+	if _, collision := record[col]; collision {
+		if _, loaded := t.metadataCollisionWarnedFields.LoadOrStore(col, struct{}{}); !loaded {
+			t.sugar.Warnf("kafka_metadata column %q collides with payload field; metadata value wins (logged once per column)", col)
+		}
+	}
+	record[col] = val
 }
