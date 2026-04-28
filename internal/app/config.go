@@ -31,6 +31,7 @@ type Config struct {
 	SchemaRegistry string `yaml:"schema_registry"`
 	ClickHouseDSN  string `yaml:"clickhouse_dsn"`
 	GroupID        string `yaml:"group_id"`
+	ClientID       string `yaml:"client_id"`
 	DLQTopicSuffix string `yaml:"dlq_topic_suffix"`
 	InputFormat    string `yaml:"input_format"`
 
@@ -118,6 +119,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.GroupID == "" {
 		cfg.GroupID = "kahouse"
+	}
+	if cfg.ClientID == "" {
+		cfg.ClientID = "kahouse"
 	}
 	if cfg.DLQTopicSuffix == "" {
 		cfg.DLQTopicSuffix = ".dlq"
@@ -318,6 +322,7 @@ func configLogFields(cfg *Config) []interface{} {
 		"clickhouse_async_insert", cfg.ClickHouseAsyncInsert,
 		"clickhouse_wait_for_async_insert", cfg.ClickHouseWaitForAsyncInsert,
 		"group_id", cfg.GroupID,
+		"client_id", cfg.ClientID,
 		"dlq_topic_suffix", cfg.DLQTopicSuffix,
 		"input_format", cfg.InputFormat,
 		"string_value_column", cfg.StringValueColumn,
