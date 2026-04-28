@@ -69,6 +69,7 @@ type SinkTask struct {
 	repairMode         atomic.Int32
 	asyncInsert        bool
 	waitForAsyncInsert bool
+	startAt            *StartAt
 }
 
 func (t *SinkTask) IsStopped() bool {
@@ -121,14 +122,7 @@ func NewSinkTask(
 		return nil, fmt.Errorf("failed to create Kafka consumer for topic %s: %w", mapping.Topic, err)
 	}
 
-	if err := consumer.SubscribeTopics([]string{mapping.Topic}, nil); err != nil {
-		if closeErr := consumer.Close(); closeErr != nil {
-			return nil, fmt.Errorf("failed to subscribe to topic %s: %w (consumer close failed: %v)", mapping.Topic, err, closeErr)
-		}
-		return nil, fmt.Errorf("failed to subscribe to topic %s: %w", mapping.Topic, err)
-	}
-
-	return &SinkTask{
+	task := &SinkTask{
 		mapping:            mapping,
 		dlqTopicSuffix:     cfg.DLQTopicSuffix,
 		chConn:             chConn,
@@ -138,7 +132,56 @@ func NewSinkTask(
 		sugar:              sugar.With("topic", mapping.Topic),
 		asyncInsert:        cfg.ClickHouseAsyncInsert,
 		waitForAsyncInsert: cfg.ClickHouseWaitForAsyncInsert,
-	}, nil
+		startAt:            mapping.StartAt,
+	}
+
+	if err := consumer.Subscribe(mapping.Topic, task.onRebalance); err != nil {
+		if closeErr := consumer.Close(); closeErr != nil {
+			return nil, fmt.Errorf("failed to subscribe to topic %s: %w (consumer close failed: %v)", mapping.Topic, err, closeErr)
+		}
+		return nil, fmt.Errorf("failed to subscribe to topic %s: %w", mapping.Topic, err)
+	}
+
+	return task, nil
+}
+
+// onRebalance handles partition assignment events from the Kafka consumer group.
+// When a partition is freshly assigned and the group has no committed offset for it,
+// the configured StartAt position (if any) is used as the starting offset.
+// Partitions with existing committed offsets are never re-seeked, so this is safe
+// to leave configured across restarts.
+func (t *SinkTask) onRebalance(c *kafka.Consumer, ev kafka.Event) error {
+	switch e := ev.(type) {
+	case kafka.AssignedPartitions:
+		resolved, decisions, err := resolveAssignment(c, e.Partitions, t.startAt, 10000)
+		if err != nil {
+			t.sugar.Errorw("Failed to resolve start position, using committed/auto_offset_reset",
+				"error", err,
+				"partitions", len(e.Partitions),
+			)
+			// Fall back to a plain Assign with OffsetStored so processing can proceed.
+			fallback := make([]kafka.TopicPartition, len(e.Partitions))
+			for i, p := range e.Partitions {
+				p.Offset = kafka.OffsetStored
+				fallback[i] = p
+			}
+			return c.Assign(fallback)
+		}
+		for _, d := range decisions {
+			startAtAppliedTotal.WithLabelValues(t.mapping.Topic, string(d.Decision)).Inc()
+			if d.Decision != decisionCommitted {
+				t.sugar.Infow("Applied start_at decision",
+					"partition", d.Partition,
+					"decision", string(d.Decision),
+					"offset", d.Offset,
+				)
+			}
+		}
+		return c.Assign(resolved)
+	case kafka.RevokedPartitions:
+		return c.Unassign()
+	}
+	return nil
 }
 
 // Run reads messages from Kafka, accumulates them into batches, and flushes to ClickHouse.
@@ -183,8 +226,8 @@ func (t *SinkTask) Run(ctx context.Context) {
 		if err != nil {
 			if kafkaErr, ok := err.(kafka.Error); ok {
 				switch kafkaErr.Code() {
-			case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
-				// Check if the batch delay has expired.
+				case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
+					// Check if the batch delay has expired.
 					if len(batch) > 0 && time.Since(firstInBatch) >= batchDelay {
 						t.sugar.Infof("Batch delay reached (%d messages), flushing", len(batch))
 						if !t.flush(ctx, table, batch, firstInBatch) {

@@ -60,6 +60,11 @@ var (
 		Name:      "task_restarts_total",
 		Help:      "Total number of times a sink task has been restarted via the admin API",
 	}, []string{"topic"})
+	startAtAppliedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "kahouse",
+		Name:      "start_at_applied_total",
+		Help:      "Per-partition starting position decisions made on assignment. Labels: topic, decision (committed | start_at_offset | start_at_timestamp | start_at_position | fallback_auto_reset).",
+	}, []string{"topic", "decision"})
 )
 
 func init() {
@@ -74,5 +79,6 @@ func init() {
 		retryCountHist,
 		taskStopped,
 		taskRestartsTotal,
+		startAtAppliedTotal,
 	)
 }

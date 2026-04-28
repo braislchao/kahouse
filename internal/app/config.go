@@ -23,6 +23,11 @@ type TopicTableMapping struct {
 	BatchDelayMs      *int   `yaml:"batch_delay_ms,omitempty"`
 	MaxRetries        *int   `yaml:"max_retries,omitempty"`
 	RetryBackoffMs    *int   `yaml:"retry_backoff_ms,omitempty"`
+
+	// StartAt optionally configures a per-topic starting position used only
+	// when the consumer group has no committed offset for a partition. See
+	// StartAt for details.
+	StartAt *StartAt `yaml:"start_at,omitempty"`
 }
 
 // Config holds all configuration for the application.
@@ -300,6 +305,11 @@ func validateConfig(cfg *Config) error {
 		}
 		if *tt.RetryBackoffMs < 0 {
 			return fmt.Errorf("topic_tables[%d]: retry_backoff_ms must be >= 0, got %d", i, *tt.RetryBackoffMs)
+		}
+		if tt.StartAt != nil {
+			if err := tt.StartAt.validate(); err != nil {
+				return fmt.Errorf("topic_tables[%d]: %w", i, err)
+			}
 		}
 	}
 

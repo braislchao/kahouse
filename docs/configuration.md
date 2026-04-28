@@ -112,6 +112,45 @@ Every field below is optional. When omitted, the value is inherited from the cor
 | `max_retries` | int | `max_retries` |
 | `retry_backoff_ms` | int | `retry_backoff_ms` |
 
+#### Per-topic starting position (`start_at`)
+
+`start_at` configures where a topic starts consuming **only when its consumer group has no committed offset for a partition**. Once a partition has any committed offset, kahouse never re-seeks it -- so `start_at` is safe to leave configured across restarts and is fully idempotent. It acts as a more expressive, per-topic version of `auto_offset_reset`.
+
+Exactly one variant must be set per topic.
+
+```yaml
+topic_tables:
+  # A. Named position -- per-topic override of auto_offset_reset
+  - topic: events.foo
+    table: events_foo
+    start_at:
+      position: earliest    # earliest | latest
+
+  # B. Timestamp -- resolved per partition via Kafka's OffsetsForTimes
+  - topic: events.bar
+    table: events_bar
+    start_at:
+      timestamp: "2026-04-01T00:00:00Z"   # RFC3339
+      # or:
+      # unix_ms: 1717200000000
+
+  # C. Explicit per-partition offsets
+  - topic: events.baz
+    table: events_baz
+    start_at:
+      offsets:
+        0: 12345
+        1: 9000
+        2: 0
+```
+
+Behavior notes:
+
+- Partitions with an existing committed offset always win; `start_at` is ignored for them.
+- For `offsets`, partitions not listed in the map fall back to the global `auto_offset_reset` (logged as `fallback_auto_reset`).
+- For `timestamp`/`unix_ms`, partitions with no message at-or-after the timestamp start at the partition's end.
+- Each per-partition decision emits a structured log line and the metric `kahouse_start_at_applied_total{topic,decision}` where `decision` is one of `committed`, `start_at_offset`, `start_at_timestamp`, `start_at_position`, or `fallback_auto_reset`.
+
 Example with overrides:
 
 ```yaml
@@ -196,3 +235,7 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `topic_tables` must have at least one entry.
 - Each topic must have a non-empty `topic` and `table`.
 - Topic names must be unique -- duplicates are rejected.
+- `start_at` (when set) must specify exactly one of `position`, `timestamp`/`unix_ms`, or `offsets`.
+- `start_at.position` must be `earliest` or `latest`.
+- `start_at.timestamp` must be RFC3339; `start_at.unix_ms` must be >= 0; the two are mutually exclusive.
+- `start_at.offsets` keys (partitions) and values (offsets) must be >= 0.

@@ -73,6 +73,20 @@ topic_tables:
     format: "avro"
     # max_retries: 0        # stop on first write failure, no retries
     # batch_delay_ms: 0     # flush as fast as possible, no accumulation delay
+    #
+    # Optional per-topic starting position. Only applied when the consumer
+    # group has no committed offset for a partition; never overrides existing
+    # progress, so it is safe across restarts. Set exactly one variant.
+    # start_at:
+    #   position: earliest                    # earliest | latest
+    # start_at:
+    #   timestamp: "2026-04-01T00:00:00Z"     # RFC3339
+    # start_at:
+    #   unix_ms: 1717200000000
+    # start_at:
+    #   offsets:
+    #     0: 12345
+    #     1: 9000
 
 # Input format notes:
 # - avro: ClickHouse columns should match the Avro schema fields.
