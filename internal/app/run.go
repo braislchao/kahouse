@@ -102,6 +102,7 @@ func Run() {
 	// Shared DLQ producer
 	dlqKafkaConfig := buildKafkaConfig(kafka.ConfigMap{
 		"bootstrap.servers": cfg.KafkaBrokers,
+		"client.id":         cfg.ClientID + "-dlq-producer",
 	}, cfg)
 	dlqProducer, err := kafka.NewProducer(&dlqKafkaConfig)
 	if err != nil {

@@ -5,6 +5,7 @@ kafka_brokers: "localhost:9092"
 schema_registry: "http://localhost:8081"
 clickhouse_dsn: "tcp://localhost:9000"
 group_id: "kahouse"
+client_id: "kahouse"            # used as Kafka client.id prefix; per-topic suffix added automatically
 dlq_topic_suffix: ".dlq"
 input_format: "avro"           # avro | json | string
 string_value_column: "value"   # used only when input_format is string

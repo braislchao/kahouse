@@ -110,6 +110,7 @@ func NewSinkTask(
 	kafkaConfig := buildKafkaConfig(kafka.ConfigMap{
 		"bootstrap.servers":    cfg.KafkaBrokers,
 		"group.id":             groupID,
+		"client.id":            cfg.ClientID + "-" + mapping.Topic,
 		"auto.offset.reset":    cfg.AutoOffsetReset,
 		"enable.auto.commit":   false,
 		"session.timeout.ms":   cfg.KafkaSessionTimeoutMs,
@@ -183,8 +184,8 @@ func (t *SinkTask) Run(ctx context.Context) {
 		if err != nil {
 			if kafkaErr, ok := err.(kafka.Error); ok {
 				switch kafkaErr.Code() {
-			case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
-				// Check if the batch delay has expired.
+				case kafka.ErrTimedOut, kafka.ErrPartitionEOF:
+					// Check if the batch delay has expired.
 					if len(batch) > 0 && time.Since(firstInBatch) >= batchDelay {
 						t.sugar.Infof("Batch delay reached (%d messages), flushing", len(batch))
 						if !t.flush(ctx, table, batch, firstInBatch) {
