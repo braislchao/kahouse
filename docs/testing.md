@@ -14,17 +14,6 @@ This script will:
 - Verify successful writes for Avro, JSON, and string topics in one run
 - Exercise DLQ handling for invalid Avro, malformed JSON, and ClickHouse write failures
 
-### 1b. Run start_at Integration Test
-```bash
-./scripts/test-startat-integration.sh
-```
-
-Validates per-topic `start_at` end-to-end against a live Kafka + ClickHouse stack:
-- `position: latest` skips pre-existing messages on a virgin group.
-- `offsets: {0: N}` starts the consumer from the configured offset.
-- `timestamp` / `unix_ms` resolves to a bounded subset via `OffsetsForTimes`.
-- After committing, `start_at` is ignored on restart (committed offsets always win).
-
 ### 2. Manual Testing
 
 #### Start the infrastructure:
