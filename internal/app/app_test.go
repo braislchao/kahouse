@@ -829,15 +829,24 @@ func TestTaskManagerTopics(t *testing.T) {
 		logger:    zap.NewNop().Sugar(),
 	}
 
-	// Manually register two managed tasks with stubs.
-	stoppedTask := &SinkTask{mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"}}
-	stoppedTask.stopped.Store(true)
+	// Manually register three managed tasks: one crashed, one operator-stopped, one running.
+	crashedTask := &SinkTask{mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"}}
+	crashedTask.stopped.Store(true)
+
+	operatorStoppedTask := &SinkTask{mapping: TopicTableMapping{Topic: "invoices", Table: "default.invoices"}}
+	operatorStoppedTask.stopped.Store(true)
+	operatorStoppedTask.MarkOperatorStop()
 
 	runningTask := &SinkTask{mapping: TopicTableMapping{Topic: "payments", Table: "default.payments"}}
 
 	mgr.tasks["orders"] = &managedTask{
-		task:    stoppedTask,
+		task:    crashedTask,
 		mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"},
+		done:    make(chan struct{}),
+	}
+	mgr.tasks["invoices"] = &managedTask{
+		task:    operatorStoppedTask,
+		mapping: TopicTableMapping{Topic: "invoices", Table: "default.invoices"},
 		done:    make(chan struct{}),
 	}
 	mgr.tasks["payments"] = &managedTask{
@@ -847,8 +856,8 @@ func TestTaskManagerTopics(t *testing.T) {
 	}
 
 	topics := mgr.Topics()
-	if len(topics) != 2 {
-		t.Fatalf("Expected 2 topics, got %d", len(topics))
+	if len(topics) != 3 {
+		t.Fatalf("Expected 3 topics, got %d", len(topics))
 	}
 
 	statusByTopic := make(map[string]TopicStatus)
@@ -859,8 +868,20 @@ func TestTaskManagerTopics(t *testing.T) {
 	if statusByTopic["orders"].Status != "stopped" {
 		t.Fatalf("Expected orders to be stopped, got %q", statusByTopic["orders"].Status)
 	}
+	if statusByTopic["orders"].StopReason != "crash" {
+		t.Fatalf("Expected orders stop_reason=crash, got %q", statusByTopic["orders"].StopReason)
+	}
+	if statusByTopic["invoices"].Status != "stopped" {
+		t.Fatalf("Expected invoices to be stopped, got %q", statusByTopic["invoices"].Status)
+	}
+	if statusByTopic["invoices"].StopReason != "operator" {
+		t.Fatalf("Expected invoices stop_reason=operator, got %q", statusByTopic["invoices"].StopReason)
+	}
 	if statusByTopic["payments"].Status != "running" {
 		t.Fatalf("Expected payments to be running, got %q", statusByTopic["payments"].Status)
+	}
+	if statusByTopic["payments"].StopReason != "" {
+		t.Fatalf("Expected payments stop_reason to be empty, got %q", statusByTopic["payments"].StopReason)
 	}
 }
 

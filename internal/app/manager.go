@@ -27,6 +27,7 @@ type TopicStatus struct {
 	Topic      string `json:"topic"`
 	Table      string `json:"table"`
 	Status     string `json:"status"`      // "running" or "stopped"
+	StopReason string `json:"stop_reason"` // "", "operator", or "crash"
 	RepairMode string `json:"repair_mode"` // "", "dlq", or "skip"
 }
 
@@ -205,13 +206,20 @@ func (m *TaskManager) Topics() []TopicStatus {
 	result := make([]TopicStatus, 0, len(m.tasks))
 	for _, mt := range m.tasks {
 		status := "running"
+		stopReason := ""
 		if mt.task.IsStopped() {
 			status = "stopped"
+			if mt.task.StoppedByOperator() {
+				stopReason = "operator"
+			} else {
+				stopReason = "crash"
+			}
 		}
 		result = append(result, TopicStatus{
 			Topic:      mt.mapping.Topic,
 			Table:      mt.mapping.Table,
 			Status:     status,
+			StopReason: stopReason,
 			RepairMode: mt.task.GetRepairMode().String(),
 		})
 	}
