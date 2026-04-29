@@ -121,6 +121,7 @@ func (m *TaskManager) Stop(topic string) error {
 		return nil
 	}
 
+	mt.task.MarkOperatorStop()
 	mt.cancel()
 	<-mt.done
 	return nil
@@ -168,6 +169,7 @@ func (m *TaskManager) Restart(topic string) error {
 	}
 
 	// Stop current task if still running.
+	mt.task.MarkOperatorStop()
 	mt.cancel()
 	<-mt.done
 
@@ -242,6 +244,11 @@ func (m *TaskManager) Wait() {
 	}
 	m.mu.RUnlock()
 
+	// Mark all tasks as operator-stopped before waiting so /livez never observes
+	// a stopped task without the flag set during process shutdown.
+	for _, mt := range snapshot {
+		mt.task.MarkOperatorStop()
+	}
 	for _, mt := range snapshot {
 		<-mt.done
 	}

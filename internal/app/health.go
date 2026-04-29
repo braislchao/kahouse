@@ -14,6 +14,7 @@ import (
 // sinkHealthChecker abstracts the health-relevant parts of a SinkTask for testability.
 type sinkHealthChecker interface {
 	IsStopped() bool
+	StoppedByOperator() bool
 	TopicName() string
 	Assignment() ([]kafka.TopicPartition, error)
 }
@@ -36,12 +37,14 @@ func NewHealth(logger *zap.SugaredLogger, chConn driver.Conn, tasks func() []sin
 	}
 }
 
-// Livez handler returns 200 if at least one sink task is still running.
-// Returns 503 when all tasks have stopped, signalling that the process should be restarted.
+// Livez handler returns 200 unless every sink task has stopped AND at least one
+// stopped unexpectedly (i.e. without an operator-initiated stop). Operator-initiated
+// stops (admin API Stop/Restart, SIGTERM) keep /livez at 200 so kubelet does not
+// kill the pod during maintenance or graceful shutdown.
 func (h *Health) Livez(w http.ResponseWriter, r *http.Request) {
-	if h.allTasksStopped() {
+	if h.livenessShouldFail() {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		if _, err := w.Write([]byte("All sink tasks have stopped")); err != nil {
+		if _, err := w.Write([]byte("All sink tasks have stopped unexpectedly")); err != nil {
 			h.logger.Warnf("Failed to write livez response: %v", err)
 		}
 		return
@@ -52,18 +55,26 @@ func (h *Health) Livez(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// allTasksStopped returns true when every registered task has exited.
-func (h *Health) allTasksStopped() bool {
+// livenessShouldFail returns true when every registered task is stopped and at
+// least one of those stops was unexpected. An empty task set also fails liveness,
+// since a process with no tasks configured is misconfigured.
+func (h *Health) livenessShouldFail() bool {
 	tasks := h.tasks()
 	if len(tasks) == 0 {
 		return true
 	}
+	allStopped := true
+	anyCrashed := false
 	for _, task := range tasks {
 		if !task.IsStopped() {
-			return false
+			allStopped = false
+			continue
+		}
+		if !task.StoppedByOperator() {
+			anyCrashed = true
 		}
 	}
-	return true
+	return allStopped && anyCrashed
 }
 
 // Readyz handler returns 200 if the service is ready to serve traffic

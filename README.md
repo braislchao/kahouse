@@ -136,7 +136,7 @@ Default port is `9090` (configurable via `metrics_port`).
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /livez` | Returns 200 if at least one task is running, 503 if all stopped |
+| `GET /livez` | Returns 200 unless every task has stopped AND at least one stopped unexpectedly. Operator-initiated stops (admin API stop/restart, SIGTERM) keep `/livez` at 200, so kubelet does not kill the pod during maintenance or graceful shutdown. |
 | `GET /readyz` | Returns 200 if ClickHouse is reachable and all consumers have partition assignments |
 | `GET /metrics` | Prometheus metrics |
 
