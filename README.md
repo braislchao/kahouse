@@ -136,7 +136,7 @@ Default port is `9090` (configurable via `metrics_port`).
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /livez` | Returns 200 if at least one task is running, 503 if all stopped |
+| `GET /livez` | Returns 200 unless every task has stopped AND at least one stopped unexpectedly. Operator-initiated stops (admin API stop/restart, SIGTERM) keep `/livez` at 200, so kubelet does not kill the pod during maintenance or graceful shutdown. |
 | `GET /readyz` | Returns 200 if ClickHouse is reachable and all consumers have partition assignments |
 | `GET /metrics` | Prometheus metrics |
 
@@ -146,7 +146,7 @@ Operational endpoints for managing individual topics at runtime.
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/topics` | List all topics with status and repair mode |
+| `GET /api/topics` | List all topics with status, stop reason, and repair mode |
 | `POST /api/topics/{topic}/stop` | Stop a single topic |
 | `POST /api/topics/{topic}/start` | Start a stopped topic (409 if already running) |
 | `POST /api/topics/{topic}/restart` | Stop and start a topic |
@@ -156,6 +156,8 @@ Operational endpoints for managing individual topics at runtime.
 ```bash
 # Check which topics are running
 curl http://localhost:9090/api/topics
+# -> [{"topic":"orders","table":"default.orders","status":"stopped","stop_reason":"crash","repair_mode":""}, ...]
+# stop_reason is "operator" (admin API stop/restart or SIGTERM), "crash" (unexpected exit), or "" (running).
 
 # Start a stopped topic
 curl -X POST http://localhost:9090/api/topics/orders/start

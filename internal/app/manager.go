@@ -27,6 +27,7 @@ type TopicStatus struct {
 	Topic      string `json:"topic"`
 	Table      string `json:"table"`
 	Status     string `json:"status"`      // "running" or "stopped"
+	StopReason string `json:"stop_reason"` // "", "operator", or "crash"
 	RepairMode string `json:"repair_mode"` // "", "dlq", or "skip"
 }
 
@@ -121,6 +122,7 @@ func (m *TaskManager) Stop(topic string) error {
 		return nil
 	}
 
+	mt.task.MarkOperatorStop()
 	mt.cancel()
 	<-mt.done
 	return nil
@@ -168,6 +170,7 @@ func (m *TaskManager) Restart(topic string) error {
 	}
 
 	// Stop current task if still running.
+	mt.task.MarkOperatorStop()
 	mt.cancel()
 	<-mt.done
 
@@ -203,13 +206,20 @@ func (m *TaskManager) Topics() []TopicStatus {
 	result := make([]TopicStatus, 0, len(m.tasks))
 	for _, mt := range m.tasks {
 		status := "running"
+		stopReason := ""
 		if mt.task.IsStopped() {
 			status = "stopped"
+			if mt.task.StoppedByOperator() {
+				stopReason = "operator"
+			} else {
+				stopReason = "crash"
+			}
 		}
 		result = append(result, TopicStatus{
 			Topic:      mt.mapping.Topic,
 			Table:      mt.mapping.Table,
 			Status:     status,
+			StopReason: stopReason,
 			RepairMode: mt.task.GetRepairMode().String(),
 		})
 	}
@@ -242,6 +252,11 @@ func (m *TaskManager) Wait() {
 	}
 	m.mu.RUnlock()
 
+	// Mark all tasks as operator-stopped before waiting so /livez never observes
+	// a stopped task without the flag set during process shutdown.
+	for _, mt := range snapshot {
+		mt.task.MarkOperatorStop()
+	}
 	for _, mt := range snapshot {
 		<-mt.done
 	}

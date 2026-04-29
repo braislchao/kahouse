@@ -48,13 +48,15 @@ func validConfig() Config {
 }
 
 type stubSinkChecker struct {
-	stopped    bool
-	topic      string
-	assignment []kafka.TopicPartition
-	err        error
+	stopped           bool
+	stoppedByOperator bool
+	topic             string
+	assignment        []kafka.TopicPartition
+	err               error
 }
 
 func (s stubSinkChecker) IsStopped() bool                             { return s.stopped }
+func (s stubSinkChecker) StoppedByOperator() bool                     { return s.stoppedByOperator }
 func (s stubSinkChecker) TopicName() string                           { return s.topic }
 func (s stubSinkChecker) Assignment() ([]kafka.TopicPartition, error) { return s.assignment, s.err }
 
@@ -707,7 +709,7 @@ func TestHealthLivenessAllStopped(t *testing.T) {
 			want:  http.StatusServiceUnavailable,
 		},
 		{
-			name: "all stopped returns 503",
+			name: "all stopped unexpectedly returns 503",
 			tasks: []sinkHealthChecker{
 				stubSinkChecker{topic: "orders", stopped: true},
 				stubSinkChecker{topic: "payments", stopped: true},
@@ -715,7 +717,31 @@ func TestHealthLivenessAllStopped(t *testing.T) {
 			want: http.StatusServiceUnavailable,
 		},
 		{
-			name: "some running returns 200",
+			name: "all stopped by operator returns 200",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", stopped: true, stoppedByOperator: true},
+				stubSinkChecker{topic: "payments", stopped: true, stoppedByOperator: true},
+			},
+			want: http.StatusOK,
+		},
+		{
+			name: "all stopped, mixed operator flag returns 503",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", stopped: true, stoppedByOperator: true},
+				stubSinkChecker{topic: "payments", stopped: true},
+			},
+			want: http.StatusServiceUnavailable,
+		},
+		{
+			name: "some running with stopped-by-operator returns 200",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", stopped: true, stoppedByOperator: true},
+				stubSinkChecker{topic: "payments"},
+			},
+			want: http.StatusOK,
+		},
+		{
+			name: "some running with crashed task returns 200",
 			tasks: []sinkHealthChecker{
 				stubSinkChecker{topic: "orders", stopped: true},
 				stubSinkChecker{topic: "payments"},
@@ -803,15 +829,24 @@ func TestTaskManagerTopics(t *testing.T) {
 		logger:    zap.NewNop().Sugar(),
 	}
 
-	// Manually register two managed tasks with stubs.
-	stoppedTask := &SinkTask{mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"}}
-	stoppedTask.stopped.Store(true)
+	// Manually register three managed tasks: one crashed, one operator-stopped, one running.
+	crashedTask := &SinkTask{mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"}}
+	crashedTask.stopped.Store(true)
+
+	operatorStoppedTask := &SinkTask{mapping: TopicTableMapping{Topic: "invoices", Table: "default.invoices"}}
+	operatorStoppedTask.stopped.Store(true)
+	operatorStoppedTask.MarkOperatorStop()
 
 	runningTask := &SinkTask{mapping: TopicTableMapping{Topic: "payments", Table: "default.payments"}}
 
 	mgr.tasks["orders"] = &managedTask{
-		task:    stoppedTask,
+		task:    crashedTask,
 		mapping: TopicTableMapping{Topic: "orders", Table: "default.orders"},
+		done:    make(chan struct{}),
+	}
+	mgr.tasks["invoices"] = &managedTask{
+		task:    operatorStoppedTask,
+		mapping: TopicTableMapping{Topic: "invoices", Table: "default.invoices"},
 		done:    make(chan struct{}),
 	}
 	mgr.tasks["payments"] = &managedTask{
@@ -821,8 +856,8 @@ func TestTaskManagerTopics(t *testing.T) {
 	}
 
 	topics := mgr.Topics()
-	if len(topics) != 2 {
-		t.Fatalf("Expected 2 topics, got %d", len(topics))
+	if len(topics) != 3 {
+		t.Fatalf("Expected 3 topics, got %d", len(topics))
 	}
 
 	statusByTopic := make(map[string]TopicStatus)
@@ -833,8 +868,20 @@ func TestTaskManagerTopics(t *testing.T) {
 	if statusByTopic["orders"].Status != "stopped" {
 		t.Fatalf("Expected orders to be stopped, got %q", statusByTopic["orders"].Status)
 	}
+	if statusByTopic["orders"].StopReason != "crash" {
+		t.Fatalf("Expected orders stop_reason=crash, got %q", statusByTopic["orders"].StopReason)
+	}
+	if statusByTopic["invoices"].Status != "stopped" {
+		t.Fatalf("Expected invoices to be stopped, got %q", statusByTopic["invoices"].Status)
+	}
+	if statusByTopic["invoices"].StopReason != "operator" {
+		t.Fatalf("Expected invoices stop_reason=operator, got %q", statusByTopic["invoices"].StopReason)
+	}
 	if statusByTopic["payments"].Status != "running" {
 		t.Fatalf("Expected payments to be running, got %q", statusByTopic["payments"].Status)
+	}
+	if statusByTopic["payments"].StopReason != "" {
+		t.Fatalf("Expected payments stop_reason to be empty, got %q", statusByTopic["payments"].StopReason)
 	}
 }
 
@@ -1599,5 +1646,137 @@ func TestSanitizeDSN(t *testing.T) {
 				t.Errorf("sanitizeDSN(%q)\n got  %q\n want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestSinkTaskOperatorStopFlag verifies the StoppedByOperator flag is independent
+// of the IsStopped flag and only flips when MarkOperatorStop is called.
+func TestSinkTaskOperatorStopFlag(t *testing.T) {
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	if task.StoppedByOperator() {
+		t.Fatal("Expected StoppedByOperator to be false on a fresh task")
+	}
+	if task.IsStopped() {
+		t.Fatal("Expected IsStopped to be false on a fresh task")
+	}
+
+	task.MarkOperatorStop()
+	if !task.StoppedByOperator() {
+		t.Fatal("Expected StoppedByOperator to be true after MarkOperatorStop")
+	}
+	if task.IsStopped() {
+		t.Fatal("MarkOperatorStop must not flip IsStopped")
+	}
+
+	task.stopped.Store(true)
+	if !task.IsStopped() {
+		t.Fatal("Expected IsStopped to be true after stopped.Store(true)")
+	}
+	if !task.StoppedByOperator() {
+		t.Fatal("StoppedByOperator must remain true once set")
+	}
+}
+
+// TestTaskManagerStopMarksOperatorFlag verifies that TaskManager.Stop marks the
+// task as operator-stopped before cancelling its context, so /livez does not
+// observe the stop as a crash.
+func TestTaskManagerStopMarksOperatorFlag(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: parentCtx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	taskCtx, taskCancel := context.WithCancel(parentCtx)
+	done := make(chan struct{})
+
+	// Simulate the run goroutine: exits on ctx cancel and sets stopped, mirroring
+	// the defers in SinkTask.Run.
+	go func() {
+		defer close(done)
+		<-taskCtx.Done()
+		task.stopped.Store(true)
+	}()
+
+	mgr.tasks["orders"] = &managedTask{
+		task:    task,
+		cancel:  taskCancel,
+		done:    done,
+		mapping: TopicTableMapping{Topic: "orders"},
+	}
+
+	if err := mgr.Stop("orders"); err != nil {
+		t.Fatalf("Stop returned unexpected error: %v", err)
+	}
+
+	if !task.IsStopped() {
+		t.Fatal("Expected task to be stopped after Stop returns")
+	}
+	if !task.StoppedByOperator() {
+		t.Fatal("Expected StoppedByOperator to be true after admin Stop")
+	}
+
+	// /livez should still return 200 even though every task is stopped, because
+	// the stop was operator-initiated.
+	health := &Health{
+		logger: zap.NewNop().Sugar(),
+		ping:   func(context.Context) error { return nil },
+		tasks:  mgr.Snapshot,
+	}
+	rr := httptest.NewRecorder()
+	health.Livez(rr, httptest.NewRequest("GET", "/livez", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected /livez 200 after operator stop, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestTaskManagerWaitMarksAllTasksOperatorStop verifies that on parent-context
+// cancellation (SIGTERM-style shutdown), Wait marks every task as
+// operator-stopped before blocking, so /livez stays at 200 during shutdown.
+func TestTaskManagerWaitMarksAllTasksOperatorStop(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: parentCtx,
+		logger:    zap.NewNop().Sugar(),
+	}
+
+	tasks := []*SinkTask{
+		{mapping: TopicTableMapping{Topic: "orders"}},
+		{mapping: TopicTableMapping{Topic: "payments"}},
+	}
+	for _, task := range tasks {
+		task := task
+		taskCtx, taskCancel := context.WithCancel(parentCtx)
+		_ = taskCancel // cancellation comes from parentCtx propagation
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			<-taskCtx.Done()
+			task.stopped.Store(true)
+		}()
+		mgr.tasks[task.mapping.Topic] = &managedTask{
+			task:    task,
+			cancel:  taskCancel,
+			done:    done,
+			mapping: task.mapping,
+		}
+	}
+
+	parentCancel()
+	mgr.Wait()
+
+	for _, task := range tasks {
+		if !task.IsStopped() {
+			t.Fatalf("Expected task %q to be stopped after Wait", task.mapping.Topic)
+		}
+		if !task.StoppedByOperator() {
+			t.Fatalf("Expected task %q to be marked operator-stopped after Wait", task.mapping.Topic)
+		}
 	}
 }

@@ -66,6 +66,7 @@ type SinkTask struct {
 	consumer           *kafka.Consumer
 	sugar              *zap.SugaredLogger
 	stopped            atomic.Bool
+	stoppedByOperator  atomic.Bool
 	repairMode         atomic.Int32
 	asyncInsert        bool
 	waitForAsyncInsert bool
@@ -74,6 +75,21 @@ type SinkTask struct {
 
 func (t *SinkTask) IsStopped() bool {
 	return t.stopped.Load()
+}
+
+// StoppedByOperator reports whether the task's stop was initiated by an operator
+// (admin API Stop/Restart) or by process shutdown (parentCtx cancel via SIGTERM).
+// Tasks that exit on their own (decode error, flush failure, commit failure, etc.)
+// will have this flag false, which the liveness check uses to detect crashes.
+func (t *SinkTask) StoppedByOperator() bool {
+	return t.stoppedByOperator.Load()
+}
+
+// MarkOperatorStop is called by the TaskManager before cancelling the task's
+// context to signal that the upcoming stop is intentional. It must be called
+// before cancel() so /livez never observes a stopped task without the flag set.
+func (t *SinkTask) MarkOperatorStop() {
+	t.stoppedByOperator.Store(true)
 }
 
 func (t *SinkTask) TopicName() string {
