@@ -105,6 +105,18 @@ topic_tables:
       key:       "__key"        # raw bytes as string -> String (or FixedString(N))
       headers:   "__headers"    # map[string]string -> Map(String, String)
 
+  # Example: topic with JSON flattening enabled.
+  # Nested JSON objects are collapsed into flat keys joined by the delimiter,
+  # matching Kafka Connect's Flatten$Value SMT behavior.
+  # - topic: "nested.events"
+  #   table: "default.events"
+  #   format: "json"
+  #   flatten:
+  #     enabled: true
+  #     delimiter: "_"          # default: "_"
+  #     # max_depth: 0          # 0 = unlimited (default)
+  #     # preserve_arrays: true # arrays preserved as-is (default)
+
 # Input format notes:
 # - avro: ClickHouse columns should match the Avro schema fields.
 # - json: JSON objects are decoded generically; integers arrive as Int64 and decimals as Float64.
