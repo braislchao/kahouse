@@ -59,13 +59,17 @@ curl http://localhost:9090/metrics
 | `test` | 3 | Avro | `default.test` |
 | `orders` | 3 | JSON | `default.orders` |
 | `payments` | 3 | String | `default.payments` |
+| `metadata_test` | 1 | JSON | `default.metadata_test` |
 
 ### ClickHouse Tables
 The automated test creates per-topic tables that match each format:
 
-- `default.test`: Avro fields plus Kafka metadata
-- `default.orders`: JSON fields plus Kafka metadata
-- `default.payments`: raw string `value` plus Kafka metadata
+- `default.test`: Avro fields only
+- `default.orders`: JSON fields only
+- `default.payments`: raw string `value` column only
+- `default.metadata_test`: JSON fields plus the six Kafka metadata columns
+  (`__offset`, `__partition`, `__topic`, `__timestamp`, `__key`, `__headers`)
+  injected via the `kafka_metadata` feature
 
 ## Testing Scenarios
 

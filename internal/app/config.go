@@ -15,19 +15,67 @@ import (
 // Numeric fields are pointers so that nil ("not set") can be distinguished from an explicit zero.
 // A nil field inherits the global default; a non-nil field (including *0) is used as-is.
 type TopicTableMapping struct {
-	Topic             string `yaml:"topic"`
-	Table             string `yaml:"table"`
-	Format            string `yaml:"format,omitempty"`
-	StringValueColumn string `yaml:"string_value_column,omitempty"`
-	BatchSize         *int   `yaml:"batch_size,omitempty"`
-	BatchDelayMs      *int   `yaml:"batch_delay_ms,omitempty"`
-	MaxRetries        *int   `yaml:"max_retries,omitempty"`
-	RetryBackoffMs    *int   `yaml:"retry_backoff_ms,omitempty"`
+	Topic             string                `yaml:"topic"`
+	Table             string                `yaml:"table"`
+	Format            string                `yaml:"format,omitempty"`
+	StringValueColumn string                `yaml:"string_value_column,omitempty"`
+	BatchSize         *int                  `yaml:"batch_size,omitempty"`
+	BatchDelayMs      *int                  `yaml:"batch_delay_ms,omitempty"`
+	MaxRetries        *int                  `yaml:"max_retries,omitempty"`
+	RetryBackoffMs    *int                  `yaml:"retry_backoff_ms,omitempty"`
+	KafkaMetadata     *KafkaMetadataMapping `yaml:"kafka_metadata,omitempty"`
 
 	// StartAt optionally configures a per-topic starting position used only
 	// when the consumer group has no committed offset for a partition. See
 	// StartAt for details.
 	StartAt *StartAt `yaml:"start_at,omitempty"`
+}
+
+// KafkaMetadataMapping configures injection of Kafka message metadata as
+// additional columns in the decoded record before it is written to ClickHouse.
+// Each field is optional: an empty string means "do not inject that field".
+// When a decoded record already contains a key matching one of these column
+// names, the metadata value overwrites it and a warning is logged once per
+// column per task.
+type KafkaMetadataMapping struct {
+	Offset    string `yaml:"offset,omitempty"`
+	Partition string `yaml:"partition,omitempty"`
+	Topic     string `yaml:"topic,omitempty"`
+	Timestamp string `yaml:"timestamp,omitempty"`
+	Key       string `yaml:"key,omitempty"`
+	Headers   string `yaml:"headers,omitempty"`
+}
+
+// IsEmpty returns true if no metadata column is configured.
+func (k *KafkaMetadataMapping) IsEmpty() bool {
+	if k == nil {
+		return true
+	}
+	return k.Offset == "" && k.Partition == "" && k.Topic == "" &&
+		k.Timestamp == "" && k.Key == "" && k.Headers == ""
+}
+
+// fields returns the configured (name, columnName) pairs in a stable order.
+// Empty column names are omitted.
+func (k *KafkaMetadataMapping) fields() []struct{ name, column string } {
+	if k == nil {
+		return nil
+	}
+	all := []struct{ name, column string }{
+		{"offset", k.Offset},
+		{"partition", k.Partition},
+		{"topic", k.Topic},
+		{"timestamp", k.Timestamp},
+		{"key", k.Key},
+		{"headers", k.Headers},
+	}
+	out := make([]struct{ name, column string }, 0, len(all))
+	for _, f := range all {
+		if f.column != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // Config holds all configuration for the application.
@@ -109,6 +157,14 @@ func (m *TopicTableMapping) resolve(cfg *Config) {
 	}
 	if m.RetryBackoffMs == nil {
 		m.RetryBackoffMs = cfg.RetryBackoffMs
+	}
+	if m.KafkaMetadata != nil {
+		m.KafkaMetadata.Offset = strings.TrimSpace(m.KafkaMetadata.Offset)
+		m.KafkaMetadata.Partition = strings.TrimSpace(m.KafkaMetadata.Partition)
+		m.KafkaMetadata.Topic = strings.TrimSpace(m.KafkaMetadata.Topic)
+		m.KafkaMetadata.Timestamp = strings.TrimSpace(m.KafkaMetadata.Timestamp)
+		m.KafkaMetadata.Key = strings.TrimSpace(m.KafkaMetadata.Key)
+		m.KafkaMetadata.Headers = strings.TrimSpace(m.KafkaMetadata.Headers)
 	}
 }
 
@@ -313,6 +369,15 @@ func validateConfig(cfg *Config) error {
 		if tt.StartAt != nil {
 			if err := tt.StartAt.validate(); err != nil {
 				return fmt.Errorf("topic_tables[%d]: %w", i, err)
+			}
+		}
+		if !tt.KafkaMetadata.IsEmpty() {
+			seenCols := make(map[string]string, 6)
+			for _, f := range tt.KafkaMetadata.fields() {
+				if prev, exists := seenCols[f.column]; exists {
+					return fmt.Errorf("topic_tables[%d]: kafka_metadata has duplicate column name %q (used by both %q and %q)", i, f.column, prev, f.name)
+				}
+				seenCols[f.column] = f.name
 			}
 		}
 	}
