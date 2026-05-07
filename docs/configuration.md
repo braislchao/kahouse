@@ -280,3 +280,37 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `start_at.timestamp` must be RFC3339; `start_at.unix_ms` must be >= 0; the two are mutually exclusive.
 - `start_at.offsets` keys (partitions) and values (offsets) must be >= 0.
 - Within a single topic's `kafka_metadata` block, column names must be unique across the six subfields.
+- `flatten` (when enabled) requires `format: json`; `delimiter` must not be empty; `max_depth` must be >= 0.
+
+#### Per-topic JSON flattening (`flatten`)
+
+`flatten` configures optional JSON object flattening before insertion, providing parity with Kafka Connect's `org.apache.kafka.connect.transforms.Flatten$Value` SMT. When enabled, nested JSON objects are recursively collapsed into a single-level map by joining keys with a configurable delimiter.
+
+This is useful for topics produced by systems that emit nested JSON where ClickHouse expects flat columns.
+
+```yaml
+topic_tables:
+  - topic: nested.events
+    table: default.events
+    format: json
+    flatten:
+      enabled: true
+      delimiter: "_"         # join nested keys with underscore (default)
+      max_depth: 0           # 0 = unlimited recursion (default)
+      preserve_arrays: true  # arrays are not descended into (default)
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable flattening. When `false` (default), no transformation is applied. |
+| `delimiter` | string | `_` | Character(s) used to join nested keys. |
+| `max_depth` | int | `0` | Maximum recursion depth. `0` = unlimited. `1` = only flatten the first level of nesting. |
+| `preserve_arrays` | bool | `true` | When `true`, arrays are preserved as-is (not descended into), matching Kafka Connect behavior. |
+
+**Behavior:**
+- Nested objects are recursively walked; keys are joined with the delimiter (e.g. `{"a":{"b":1}}` → `{"a_b":1}`).
+- Arrays are preserved as-is when `preserve_arrays` is `true`.
+- Null values emit the flattened key with `null` (not dropped).
+- Flat input passes through unchanged.
+- Only supported with `format: json`. Validation rejects `flatten.enabled: true` with other formats.
+- Flattening runs **before** metadata injection (`kafka_metadata:`), so metadata columns never collide with payload keys.

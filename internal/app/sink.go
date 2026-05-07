@@ -315,6 +315,11 @@ func (t *SinkTask) Run(ctx context.Context) {
 			continue
 		}
 
+		// Apply optional per-topic JSON flattening (Kafka Connect Flatten$Value parity).
+		if fc := t.mapping.Flatten; fc != nil && fc.Enabled {
+			record = flattenRecord(record, fc.Delimiter, fc.MaxDepth, *fc.PreserveArrays)
+		}
+
 		if len(batch) == 0 {
 			firstInBatch = time.Now()
 		}

@@ -29,6 +29,35 @@ type TopicTableMapping struct {
 	// when the consumer group has no committed offset for a partition. See
 	// StartAt for details.
 	StartAt *StartAt `yaml:"start_at,omitempty"`
+
+	// Flatten optionally configures JSON object flattening before insertion,
+	// matching Kafka Connect's Flatten$Value SMT behavior.
+	Flatten *FlattenConfig `yaml:"flatten,omitempty"`
+}
+
+// FlattenConfig configures optional JSON object flattening before insertion.
+// When Enabled is true, nested JSON objects are collapsed into a single-level
+// map by joining keys with Delimiter, matching Kafka Connect's
+// org.apache.kafka.connect.transforms.Flatten$Value SMT behavior.
+type FlattenConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	Delimiter      string `yaml:"delimiter,omitempty"`
+	MaxDepth       int    `yaml:"max_depth,omitempty"`
+	PreserveArrays *bool  `yaml:"preserve_arrays,omitempty"`
+}
+
+// resolveDefaults fills zero-value fields with Kafka-Connect-compatible defaults.
+func (f *FlattenConfig) resolveDefaults() {
+	if f == nil {
+		return
+	}
+	if f.Delimiter == "" {
+		f.Delimiter = "_"
+	}
+	if f.PreserveArrays == nil {
+		t := true
+		f.PreserveArrays = &t
+	}
 }
 
 // KafkaMetadataMapping configures injection of Kafka message metadata as
@@ -165,6 +194,9 @@ func (m *TopicTableMapping) resolve(cfg *Config) {
 		m.KafkaMetadata.Timestamp = strings.TrimSpace(m.KafkaMetadata.Timestamp)
 		m.KafkaMetadata.Key = strings.TrimSpace(m.KafkaMetadata.Key)
 		m.KafkaMetadata.Headers = strings.TrimSpace(m.KafkaMetadata.Headers)
+	}
+	if m.Flatten != nil {
+		m.Flatten.resolveDefaults()
 	}
 }
 
@@ -378,6 +410,17 @@ func validateConfig(cfg *Config) error {
 					return fmt.Errorf("topic_tables[%d]: kafka_metadata has duplicate column name %q (used by both %q and %q)", i, f.column, prev, f.name)
 				}
 				seenCols[f.column] = f.name
+			}
+		}
+		if tt.Flatten != nil && tt.Flatten.Enabled {
+			if tt.Format != "json" {
+				return fmt.Errorf("topic_tables[%d]: flatten is only supported with json format, got %q", i, tt.Format)
+			}
+			if tt.Flatten.Delimiter == "" {
+				return fmt.Errorf("topic_tables[%d]: flatten.delimiter must not be empty when flatten is enabled", i)
+			}
+			if tt.Flatten.MaxDepth < 0 {
+				return fmt.Errorf("topic_tables[%d]: flatten.max_depth must be >= 0, got %d", i, tt.Flatten.MaxDepth)
 			}
 		}
 	}
