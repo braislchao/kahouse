@@ -148,13 +148,46 @@ func isIntegerType(chType string) bool {
 	return false
 }
 
+// isDateTimeType returns true if the ClickHouse type (after stripping Nullable) is a
+// DateTime-family type that accepts time.Time via the native protocol driver.
+func isDateTimeType(chType string) bool {
+	t := chType
+	if strings.HasPrefix(t, "Nullable(") && strings.HasSuffix(t, ")") {
+		t = t[len("Nullable(") : len(t)-1]
+	}
+	switch {
+	case t == "DateTime", t == "Date", t == "Date32":
+		return true
+	case strings.HasPrefix(t, "DateTime64"):
+		return true
+	}
+	return false
+}
+
 // coerceValue converts Go types that clickhouse-go cannot handle natively for
 // certain column types. Currently handles:
 //   - time.Time → int64 when the target column is an integer type. goavro decodes
 //     Avro logicalType "date" (int, days since epoch) as time.Time at midnight UTC.
 //     ClickHouse columns ALTERed from Date to Int64 (e.g. to handle overflow dates
 //     like year 3029) cannot accept time.Time via the native protocol driver.
+//   - string (RFC3339/ISO8601) → time.Time when the target column is a DateTime-family
+//     type. clickhouse-go's native protocol rejects RFC3339 strings (with "T" separator)
+//     but accepts time.Time natively for DateTime/DateTime64 columns.
 func coerceValue(val interface{}, chType string) interface{} {
+	// Handle string timestamps for DateTime columns.
+	if s, ok := val.(string); ok {
+		if isDateTimeType(chType) {
+			if parsed, err := time.Parse(time.RFC3339, s); err == nil {
+				return parsed
+			}
+			// Also try RFC3339Nano for sub-second precision.
+			if parsed, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				return parsed
+			}
+		}
+		return val
+	}
+
 	t, ok := val.(time.Time)
 	if !ok {
 		return val
