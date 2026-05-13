@@ -74,7 +74,7 @@ type SinkTask struct {
 	startAt                       *StartAt
 	metadataMapping               *KafkaMetadataMapping
 	metadataCollisionWarnedFields sync.Map // key: column name (string), value: struct{}
-	allowedColumns                map[string]struct{}
+	columnInfo                    ColumnInfo
 }
 
 func (t *SinkTask) IsStopped() bool {
@@ -120,7 +120,7 @@ func NewSinkTask(
 	srClient schemaregistry.Client,
 	dlqProducer *kafka.Producer,
 	sugar *zap.SugaredLogger,
-	allowedColumns map[string]struct{},
+	columnInfo ColumnInfo,
 ) (*SinkTask, error) {
 	decoder, err := newMessageDecoder(mapping.Format, mapping.StringValueColumn, srClient)
 	if err != nil {
@@ -156,7 +156,7 @@ func NewSinkTask(
 		waitForAsyncInsert: cfg.ClickHouseWaitForAsyncInsert,
 		startAt:            mapping.StartAt,
 		metadataMapping:    resolveMetadataMapping(mapping.KafkaMetadata),
-		allowedColumns:     allowedColumns,
+		columnInfo:         columnInfo,
 	}
 
 	if err := consumer.Subscribe(mapping.Topic, task.onRebalance); err != nil {
@@ -434,7 +434,7 @@ func (t *SinkTask) writeWithRetries(ctx context.Context, table string, batch []m
 			t.sugar.Infof("Retrying batch write (attempt %d/%d) after %v", attempt+1, maxRetries+1, wait)
 		}
 		var writeErr error
-		timing, writeErr = writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert, t.allowedColumns)
+		timing, writeErr = writeBatch(ctx, table, t.chConn, batch, t.asyncInsert, t.waitForAsyncInsert, t.columnInfo)
 		if writeErr != nil {
 			if !isRetriableClickHouseError(writeErr) {
 				t.sugar.Errorf("Non-retriable ClickHouse error, skipping retries: %v", writeErr)

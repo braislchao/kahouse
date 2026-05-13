@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -509,6 +510,98 @@ func TestNormalizeAvroValueKeepsRegularObjects(t *testing.T) {
 	}
 	if inner["value"] != "abc-123" {
 		t.Fatalf("Expected non-union map contents to stay intact, got %#v", inner)
+	}
+}
+
+func TestCoerceValueDateToInt64(t *testing.T) {
+	// goavro decodes logicalType "date" (days since epoch) as midnight UTC time.Time.
+	dateVal := time.Date(2024, 4, 12, 0, 0, 0, 0, time.UTC)
+	expected := int64(19825) // 2024-04-12 is 19825 days since epoch
+
+	// When target column is Int64, should convert to days-since-epoch.
+	got := coerceValue(dateVal, "Int64")
+	days, ok := got.(int64)
+	if !ok {
+		t.Fatalf("Expected int64 for Int64 column, got %T (%v)", got, got)
+	}
+	if days != expected {
+		t.Fatalf("Expected %d days since epoch, got %d", expected, days)
+	}
+
+	// Nullable(Int64) should also work.
+	got2 := coerceValue(dateVal, "Nullable(Int64)")
+	days2, ok := got2.(int64)
+	if !ok {
+		t.Fatalf("Expected int64 for Nullable(Int64) column, got %T (%v)", got2, got2)
+	}
+	if days2 != expected {
+		t.Fatalf("Expected %d days, got %d", expected, days2)
+	}
+
+	// When target column is Date, should keep time.Time untouched.
+	got3 := coerceValue(dateVal, "Date")
+	if _, ok := got3.(time.Time); !ok {
+		t.Fatalf("Expected time.Time for Date column, got %T (%v)", got3, got3)
+	}
+
+	// When target column is Date32, should keep time.Time untouched.
+	got4 := coerceValue(dateVal, "Nullable(Date32)")
+	if _, ok := got4.(time.Time); !ok {
+		t.Fatalf("Expected time.Time for Nullable(Date32) column, got %T (%v)", got4, got4)
+	}
+
+	// Pre-1970 date: 1960-06-15 is -3488 days since epoch.
+	pre1970 := time.Date(1960, 6, 15, 0, 0, 0, 0, time.UTC)
+	got5 := coerceValue(pre1970, "Int64")
+	days5, ok := got5.(int64)
+	if !ok {
+		t.Fatalf("Expected int64 for pre-1970 date, got %T (%v)", got5, got5)
+	}
+	if days5 >= 0 {
+		t.Fatalf("Expected negative days for pre-1970 date, got %d", days5)
+	}
+	// Verify round-trip: days back to date.
+	roundTrip := unixEpoch.AddDate(0, 0, int(days5))
+	if !roundTrip.Equal(pre1970) {
+		t.Fatalf("Round-trip failed: expected %v, got %v (days=%d)", pre1970, roundTrip, days5)
+	}
+
+	// Unix epoch itself should be 0.
+	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	got6 := coerceValue(epoch, "Int64")
+	days6, ok := got6.(int64)
+	if !ok {
+		t.Fatalf("Expected int64 for epoch, got %T (%v)", got6, got6)
+	}
+	if days6 != 0 {
+		t.Fatalf("Expected 0 days for epoch, got %d", days6)
+	}
+}
+
+func TestCoerceValueTimestampToMillis(t *testing.T) {
+	// goavro decodes logicalType "timestamp-millis" as time.Time with non-zero time component.
+	tsVal := time.Date(2024, 4, 12, 14, 30, 45, 123000000, time.UTC)
+
+	got := coerceValue(tsVal, "Int64")
+	millis, ok := got.(int64)
+	if !ok {
+		t.Fatalf("Expected int64 for timestamp to Int64 column, got %T (%v)", got, got)
+	}
+	if millis != tsVal.UnixMilli() {
+		t.Fatalf("Expected %d millis, got %d", tsVal.UnixMilli(), millis)
+	}
+}
+
+func TestCoerceValueNonTimePassthrough(t *testing.T) {
+	// Non-time values should pass through unchanged.
+	got := coerceValue(int32(42), "Int64")
+	if got != int32(42) {
+		t.Fatalf("Expected int32(42) passthrough, got %T (%v)", got, got)
+	}
+
+	got2 := coerceValue("hello", "String")
+	if got2 != "hello" {
+		t.Fatalf("Expected string passthrough, got %T (%v)", got2, got2)
 	}
 }
 
@@ -1167,9 +1260,14 @@ func TestHandleStartTopicConcurrentSafety(t *testing.T) {
 // stubConn is a minimal stub implementing driver.Conn for testing validateTables.
 type stubConn struct {
 	driver.Conn
-	execErr  map[string]error    // keyed by SQL query substring
-	queryErr map[string]error    // keyed by SQL query substring
-	columns  map[string][]string // table pattern -> column names
+	execErr  map[string]error        // keyed by SQL query substring
+	queryErr map[string]error        // keyed by SQL query substring
+	columns  map[string][]stubColumn // table pattern -> columns (name + type)
+}
+
+type stubColumn struct {
+	name    string
+	colType string
 }
 
 func (c *stubConn) Exec(ctx context.Context, query string, args ...interface{}) error {
@@ -1187,7 +1285,6 @@ func (c *stubConn) Query(ctx context.Context, query string, args ...interface{})
 			return nil, err
 		}
 	}
-	// Find matching columns for the queried table
 	for pattern, cols := range c.columns {
 		if strings.Contains(query, pattern) {
 			return &stubRows{columns: cols, pos: 0}, nil
@@ -1198,7 +1295,7 @@ func (c *stubConn) Query(ctx context.Context, query string, args ...interface{})
 
 // stubRows implements driver.Rows for DESCRIBE TABLE results.
 type stubRows struct {
-	columns []string
+	columns []stubColumn
 	pos     int
 }
 
@@ -1210,13 +1307,13 @@ func (r *stubRows) Scan(dest ...interface{}) error {
 	if r.pos >= len(r.columns) {
 		return fmt.Errorf("no more rows")
 	}
+	col := r.columns[r.pos]
 	// DESCRIBE TABLE returns: name, type, default_type, default_expr, comment, codec_expr, ttl_expr
-	ptrs := []interface{}{&r.columns[r.pos], new(string), new(string), new(string), new(string), new(string), new(string)}
+	vals := []string{col.name, col.colType, "", "", "", "", ""}
 	for i, d := range dest {
-		if i < len(ptrs) {
-			switch dp := d.(type) {
-			case *string:
-				*dp = *(ptrs[i].(*string))
+		if i < len(vals) {
+			if dp, ok := d.(*string); ok {
+				*dp = vals[i]
 			}
 		}
 	}
@@ -1235,9 +1332,9 @@ func (r *stubRows) HasData() bool                    { return r.pos < len(r.colu
 
 func TestValidateTablesSuccess(t *testing.T) {
 	conn := &stubConn{
-		columns: map[string][]string{
-			"orders":   {"id", "amount"},
-			"payments": {"id", "status"},
+		columns: map[string][]stubColumn{
+			"orders":   {{name: "id", colType: "String"}, {name: "amount", colType: "Float64"}},
+			"payments": {{name: "id", colType: "String"}, {name: "status", colType: "String"}},
 		},
 	}
 	tables := []TopicTableMapping{

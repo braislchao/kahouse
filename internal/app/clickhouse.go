@@ -71,29 +71,31 @@ func quoteTableIdentifier(name string) (string, error) {
 	return strings.Join(quoted, "."), nil
 }
 
-// TableColumns maps a table name to its set of column names.
-type TableColumns map[string]map[string]struct{}
+// ColumnInfo maps column name to its ClickHouse type string (e.g. "Nullable(Int64)", "Date", "String").
+type ColumnInfo map[string]string
 
-// getTableColumns queries ClickHouse for the column names of the given table.
-func getTableColumns(ctx context.Context, chConn driver.Conn, table string) (map[string]struct{}, error) {
+// TableColumns maps a table name to its column info.
+type TableColumns map[string]ColumnInfo
+
+// getTableColumns queries ClickHouse for the column names and types of the given table.
+func getTableColumns(ctx context.Context, chConn driver.Conn, table string) (ColumnInfo, error) {
 	quotedTable, err := quoteTableIdentifier(table)
 	if err != nil {
 		return nil, fmt.Errorf("invalid table name %q: %w", table, err)
 	}
-	// DESCRIBE TABLE returns rows with at least (name, type, ...).
 	rows, err := chConn.Query(ctx, fmt.Sprintf("DESCRIBE TABLE %s", quotedTable))
 	if err != nil {
 		return nil, fmt.Errorf("failed to describe table %q: %w", table, err)
 	}
 	defer rows.Close()
 
-	cols := make(map[string]struct{})
+	cols := make(ColumnInfo)
 	for rows.Next() {
 		var name, colType, defaultType, defaultExpr, comment, codecExpr, ttlExpr string
 		if err := rows.Scan(&name, &colType, &defaultType, &defaultExpr, &comment, &codecExpr, &ttlExpr); err != nil {
 			return nil, fmt.Errorf("failed to scan DESCRIBE row for table %q: %w", table, err)
 		}
-		cols[name] = struct{}{}
+		cols[name] = colType
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating DESCRIBE rows for table %q: %w", table, err)
@@ -127,10 +129,62 @@ type batchTiming struct {
 	Send    time.Duration
 }
 
+// unixEpoch is used to convert time.Time back to days-since-epoch for integer columns.
+var unixEpoch = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// isIntegerType returns true if the ClickHouse type (after stripping Nullable) is an integer type.
+func isIntegerType(chType string) bool {
+	// Strip Nullable wrapper
+	t := chType
+	if strings.HasPrefix(t, "Nullable(") && strings.HasSuffix(t, ")") {
+		t = t[len("Nullable(") : len(t)-1]
+	}
+	switch t {
+	case "Int8", "Int16", "Int32", "Int64",
+		"UInt8", "UInt16", "UInt32", "UInt64",
+		"Int128", "Int256", "UInt128", "UInt256":
+		return true
+	}
+	return false
+}
+
+// coerceValue converts Go types that clickhouse-go cannot handle natively for
+// certain column types. Currently handles:
+//   - time.Time → int64 when the target column is an integer type. goavro decodes
+//     Avro logicalType "date" (int, days since epoch) as time.Time at midnight UTC.
+//     ClickHouse columns ALTERed from Date to Int64 (e.g. to handle overflow dates
+//     like year 3029) cannot accept time.Time via the native protocol driver.
+func coerceValue(val interface{}, chType string) interface{} {
+	t, ok := val.(time.Time)
+	if !ok {
+		return val
+	}
+	if !isIntegerType(chType) {
+		// Date, Date32, DateTime, DateTime64 — driver handles time.Time natively.
+		return val
+	}
+	// Convert time.Time to days-since-epoch (preserves the original Avro int value).
+	// goavro creates midnight-UTC time.Time for logicalType "date", so this is lossless.
+	// Use integer division on seconds to avoid float64 precision loss on large values
+	// and to correctly handle dates before 1970 (negative day counts).
+	if t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {
+		const secsPerDay = 86400
+		secs := int64(t.Sub(unixEpoch).Seconds())
+		days := secs / secsPerDay
+		if secs%secsPerDay != 0 && secs < 0 {
+			days-- // floor division for negative values
+		}
+		return days
+	}
+	// For timestamp-millis/micros (non-midnight), return unix milliseconds.
+	return t.UnixMilli()
+}
+
 // writeBatch writes a batch of records to a ClickHouse table.
-// If allowedColumns is non-nil, only columns present in the set are included in the INSERT,
-// mirroring the behavior of Kafka Connect's cleanupExtraFields.
-func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool, allowedColumns map[string]struct{}) (batchTiming, error) {
+// If columnInfo is non-nil, only columns present in the map are included in the INSERT
+// (mirroring Kafka Connect's cleanupExtraFields), and values are coerced to match
+// the ClickHouse column type when needed.
+func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool, columnInfo ColumnInfo) (batchTiming, error) {
 	var timing batchTiming
 	if len(batch) == 0 {
 		return timing, nil
@@ -148,9 +202,9 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 	// Filter out columns that don't exist in the ClickHouse table (like Kafka Connect's
 	// cleanupExtraFields). This prevents errors when the Avro schema has fields that
 	// were never added to the ClickHouse table.
-	if allowedColumns != nil {
+	if columnInfo != nil {
 		for col := range colSet {
-			if _, ok := allowedColumns[col]; !ok {
+			if _, ok := columnInfo[col]; !ok {
 				delete(colSet, col)
 			}
 		}
@@ -194,7 +248,13 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 	for _, record := range batch {
 		row := make([]interface{}, len(columns))
 		for i, col := range columns {
-			row[i] = record[col]
+			val := record[col]
+			if columnInfo != nil {
+				if chType, ok := columnInfo[col]; ok {
+					val = coerceValue(val, chType)
+				}
+			}
+			row[i] = val
 		}
 		if err := batchStmt.Append(row...); err != nil {
 			timing.Append = time.Since(appendStart)
