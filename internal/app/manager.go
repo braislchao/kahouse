@@ -35,14 +35,15 @@ type TopicStatus struct {
 // and provides an HTTP admin API for manual stop, restart, and repair-mode control.
 // It does NOT auto-restart failed tasks.
 type TaskManager struct {
-	mu          sync.RWMutex
-	tasks       map[string]*managedTask
-	cfg         *Config
-	chConn      driver.Conn
-	srClient    schemaregistry.Client
-	dlqProducer *kafka.Producer
-	logger      *zap.SugaredLogger
-	parentCtx   context.Context
+	mu           sync.RWMutex
+	tasks        map[string]*managedTask
+	cfg          *Config
+	chConn       driver.Conn
+	srClient     schemaregistry.Client
+	dlqProducer  *kafka.Producer
+	logger       *zap.SugaredLogger
+	parentCtx    context.Context
+	tableColumns TableColumns
 }
 
 // NewTaskManager creates a TaskManager bound to the given parent context.
@@ -54,15 +55,17 @@ func NewTaskManager(
 	srClient schemaregistry.Client,
 	dlqProducer *kafka.Producer,
 	logger *zap.SugaredLogger,
+	tableColumns TableColumns,
 ) *TaskManager {
 	return &TaskManager{
-		tasks:       make(map[string]*managedTask),
-		cfg:         cfg,
-		chConn:      chConn,
-		srClient:    srClient,
-		dlqProducer: dlqProducer,
-		logger:      logger,
-		parentCtx:   ctx,
+		tasks:        make(map[string]*managedTask),
+		cfg:          cfg,
+		chConn:       chConn,
+		srClient:     srClient,
+		dlqProducer:  dlqProducer,
+		logger:       logger,
+		parentCtx:    ctx,
+		tableColumns: tableColumns,
 	}
 }
 
@@ -78,7 +81,7 @@ func (m *TaskManager) StartAll() error {
 
 // startTask creates a new SinkTask, registers it in the manager, and launches it.
 func (m *TaskManager) startTask(mapping TopicTableMapping) error {
-	task, err := NewSinkTask(mapping, m.cfg, m.chConn, m.srClient, m.dlqProducer, m.logger)
+	task, err := NewSinkTask(mapping, m.cfg, m.chConn, m.srClient, m.dlqProducer, m.logger, m.tableColumns[mapping.Table])
 	if err != nil {
 		return err
 	}

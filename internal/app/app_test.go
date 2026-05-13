@@ -1167,7 +1167,9 @@ func TestHandleStartTopicConcurrentSafety(t *testing.T) {
 // stubConn is a minimal stub implementing driver.Conn for testing validateTables.
 type stubConn struct {
 	driver.Conn
-	execErr map[string]error // keyed by SQL query substring
+	execErr  map[string]error    // keyed by SQL query substring
+	queryErr map[string]error    // keyed by SQL query substring
+	columns  map[string][]string // table pattern -> column names
 }
 
 func (c *stubConn) Exec(ctx context.Context, query string, args ...interface{}) error {
@@ -1179,39 +1181,105 @@ func (c *stubConn) Exec(ctx context.Context, query string, args ...interface{}) 
 	return nil
 }
 
+func (c *stubConn) Query(ctx context.Context, query string, args ...interface{}) (driver.Rows, error) {
+	for pattern, err := range c.queryErr {
+		if strings.Contains(query, pattern) {
+			return nil, err
+		}
+	}
+	// Find matching columns for the queried table
+	for pattern, cols := range c.columns {
+		if strings.Contains(query, pattern) {
+			return &stubRows{columns: cols, pos: 0}, nil
+		}
+	}
+	return &stubRows{columns: nil, pos: 0}, nil
+}
+
+// stubRows implements driver.Rows for DESCRIBE TABLE results.
+type stubRows struct {
+	columns []string
+	pos     int
+}
+
+func (r *stubRows) Next() bool {
+	return r.pos < len(r.columns)
+}
+
+func (r *stubRows) Scan(dest ...interface{}) error {
+	if r.pos >= len(r.columns) {
+		return fmt.Errorf("no more rows")
+	}
+	// DESCRIBE TABLE returns: name, type, default_type, default_expr, comment, codec_expr, ttl_expr
+	ptrs := []interface{}{&r.columns[r.pos], new(string), new(string), new(string), new(string), new(string), new(string)}
+	for i, d := range dest {
+		if i < len(ptrs) {
+			switch dp := d.(type) {
+			case *string:
+				*dp = *(ptrs[i].(*string))
+			}
+		}
+	}
+	r.pos++
+	return nil
+}
+
+func (r *stubRows) Close() error                     { return nil }
+func (r *stubRows) Err() error                       { return nil }
+func (r *stubRows) Columns() []string                { return nil }
+func (r *stubRows) Types() []string                  { return nil }
+func (r *stubRows) ScanStruct(dest any) error        { return fmt.Errorf("not implemented") }
+func (r *stubRows) ColumnTypes() []driver.ColumnType { return nil }
+func (r *stubRows) Totals(dest ...any) error         { return nil }
+func (r *stubRows) HasData() bool                    { return r.pos < len(r.columns) }
+
 func TestValidateTablesSuccess(t *testing.T) {
-	conn := &stubConn{execErr: map[string]error{}}
+	conn := &stubConn{
+		columns: map[string][]string{
+			"orders":   {"id", "amount"},
+			"payments": {"id", "status"},
+		},
+	}
 	tables := []TopicTableMapping{
 		{Topic: "orders", Table: "default.orders"},
 		{Topic: "payments", Table: "default.payments"},
 	}
-	if err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar()); err != nil {
+	tc, err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
+	if err != nil {
 		t.Fatalf("Expected validateTables to succeed, got %v", err)
+	}
+	if len(tc) != 2 {
+		t.Fatalf("Expected 2 table column sets, got %d", len(tc))
+	}
+	if _, ok := tc["default.orders"]["id"]; !ok {
+		t.Fatal("Expected 'id' column in default.orders")
 	}
 }
 
 func TestValidateTablesFailsOnMissingTable(t *testing.T) {
-	conn := &stubConn{execErr: map[string]error{
-		"orders": fmt.Errorf("table orders does not exist"),
-	}}
+	conn := &stubConn{
+		queryErr: map[string]error{
+			"orders": fmt.Errorf("table orders does not exist"),
+		},
+	}
 	tables := []TopicTableMapping{
 		{Topic: "orders", Table: "default.orders"},
 	}
-	err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
+	_, err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
 	if err == nil {
 		t.Fatal("Expected validateTables to fail for missing table")
 	}
-	if !strings.Contains(err.Error(), "does not exist or is not accessible") {
+	if !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("Expected 'does not exist' error, got %q", err.Error())
 	}
 }
 
 func TestValidateTablesRejectsInvalidTableName(t *testing.T) {
-	conn := &stubConn{execErr: map[string]error{}}
+	conn := &stubConn{}
 	tables := []TopicTableMapping{
 		{Topic: "orders", Table: ""},
 	}
-	err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
+	_, err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
 	if err == nil {
 		t.Fatal("Expected validateTables to reject empty table name")
 	}
