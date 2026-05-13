@@ -71,20 +71,53 @@ func quoteTableIdentifier(name string) (string, error) {
 	return strings.Join(quoted, "."), nil
 }
 
-// validateTables checks that all target tables exist and are accessible in ClickHouse.
-func validateTables(ctx context.Context, chConn driver.Conn, tables []TopicTableMapping, sugar *zap.SugaredLogger) error {
-	for _, mapping := range tables {
-		quotedTable, err := quoteTableIdentifier(mapping.Table)
-		if err != nil {
-			return fmt.Errorf("topic %s: invalid table name %q: %w", mapping.Topic, mapping.Table, err)
-		}
-		query := fmt.Sprintf("SELECT 1 FROM %s LIMIT 0", quotedTable)
-		if err := chConn.Exec(ctx, query); err != nil {
-			return fmt.Errorf("topic %s: table %q does not exist or is not accessible: %w", mapping.Topic, mapping.Table, err)
-		}
-		sugar.Infof("Validated table exists: %s -> %s", mapping.Topic, mapping.Table)
+// TableColumns maps a table name to its set of column names.
+type TableColumns map[string]map[string]struct{}
+
+// getTableColumns queries ClickHouse for the column names of the given table.
+func getTableColumns(ctx context.Context, chConn driver.Conn, table string) (map[string]struct{}, error) {
+	quotedTable, err := quoteTableIdentifier(table)
+	if err != nil {
+		return nil, fmt.Errorf("invalid table name %q: %w", table, err)
 	}
-	return nil
+	// DESCRIBE TABLE returns rows with at least (name, type, ...).
+	rows, err := chConn.Query(ctx, fmt.Sprintf("DESCRIBE TABLE %s", quotedTable))
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe table %q: %w", table, err)
+	}
+	defer rows.Close()
+
+	cols := make(map[string]struct{})
+	for rows.Next() {
+		var name, colType, defaultType, defaultExpr, comment, codecExpr, ttlExpr string
+		if err := rows.Scan(&name, &colType, &defaultType, &defaultExpr, &comment, &codecExpr, &ttlExpr); err != nil {
+			return nil, fmt.Errorf("failed to scan DESCRIBE row for table %q: %w", table, err)
+		}
+		cols[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating DESCRIBE rows for table %q: %w", table, err)
+	}
+	return cols, nil
+}
+
+// validateTables checks that all target tables exist and are accessible in ClickHouse.
+// It returns a TableColumns map with the column names for each table, which is used
+// to filter out Avro fields that don't have a matching ClickHouse column.
+func validateTables(ctx context.Context, chConn driver.Conn, tables []TopicTableMapping, sugar *zap.SugaredLogger) (TableColumns, error) {
+	tc := make(TableColumns, len(tables))
+	for _, mapping := range tables {
+		cols, err := getTableColumns(ctx, chConn, mapping.Table)
+		if err != nil {
+			return nil, fmt.Errorf("topic %s: %w", mapping.Topic, err)
+		}
+		if len(cols) == 0 {
+			return nil, fmt.Errorf("topic %s: table %q has no columns or does not exist", mapping.Topic, mapping.Table)
+		}
+		tc[mapping.Table] = cols
+		sugar.Infof("Validated table exists: %s -> %s (%d columns)", mapping.Topic, mapping.Table, len(cols))
+	}
+	return tc, nil
 }
 
 // batchTiming holds the duration of each phase inside writeBatch.
@@ -95,7 +128,9 @@ type batchTiming struct {
 }
 
 // writeBatch writes a batch of records to a ClickHouse table.
-func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool) (batchTiming, error) {
+// If allowedColumns is non-nil, only columns present in the set are included in the INSERT,
+// mirroring the behavior of Kafka Connect's cleanupExtraFields.
+func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []map[string]interface{}, asyncInsert bool, waitForAsyncInsert bool, allowedColumns map[string]struct{}) (batchTiming, error) {
 	var timing batchTiming
 	if len(batch) == 0 {
 		return timing, nil
@@ -109,6 +144,18 @@ func writeBatch(ctx context.Context, table string, chConn driver.Conn, batch []m
 			colSet[k] = struct{}{}
 		}
 	}
+
+	// Filter out columns that don't exist in the ClickHouse table (like Kafka Connect's
+	// cleanupExtraFields). This prevents errors when the Avro schema has fields that
+	// were never added to the ClickHouse table.
+	if allowedColumns != nil {
+		for col := range colSet {
+			if _, ok := allowedColumns[col]; !ok {
+				delete(colSet, col)
+			}
+		}
+	}
+
 	columns := make([]string, 0, len(colSet))
 	for k := range colSet {
 		columns = append(columns, k)

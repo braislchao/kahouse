@@ -95,7 +95,8 @@ func Run() {
 	}
 	sugar.Info("Connected to ClickHouse")
 
-	if err := validateTables(context.Background(), chConn, cfg.TopicTables, sugar); err != nil {
+	tableColumns, err := validateTables(context.Background(), chConn, cfg.TopicTables, sugar)
+	if err != nil {
 		sugar.Fatalf("Table validation failed: %v", err)
 	}
 
@@ -120,7 +121,7 @@ func Run() {
 	validateDLQTopics(dlqProducer, cfg, sugar)
 
 	// Create and start the task manager
-	mgr := NewTaskManager(ctx, cfg, chConn, srClient, dlqProducer, sugar)
+	mgr := NewTaskManager(ctx, cfg, chConn, srClient, dlqProducer, sugar, tableColumns)
 	if err := mgr.StartAll(); err != nil {
 		sugar.Errorf("Failed to start sink tasks: %v", err)
 		return
