@@ -184,6 +184,10 @@ func coerceValue(val interface{}, chType string) interface{} {
 			if parsed, err := time.Parse(time.RFC3339Nano, s); err == nil {
 				return parsed
 			}
+			// Also try date-only format (YYYY-MM-DD) → midnight UTC.
+			if parsed, err := time.Parse("2006-01-02", s); err == nil {
+				return parsed
+			}
 		}
 		return val
 	}

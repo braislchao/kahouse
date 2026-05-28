@@ -179,4 +179,15 @@ func TestCoerceValueStringRFC3339ToDateTime(t *testing.T) {
 	if got4 != "not-a-date" {
 		t.Fatalf("Expected passthrough for non-RFC3339 string, got %T (%v)", got4, got4)
 	}
+
+	// Date-only string (YYYY-MM-DD) should be parsed to midnight UTC for DateTime columns.
+	got5 := coerceValue("2100-01-01", "DateTime")
+	tv5, ok := got5.(time.Time)
+	if !ok {
+		t.Fatalf("Expected time.Time for date-only string to DateTime, got %T (%v)", got5, got5)
+	}
+	expected5 := time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !tv5.Equal(expected5) {
+		t.Fatalf("Expected %v, got %v", expected5, tv5)
+	}
 }
