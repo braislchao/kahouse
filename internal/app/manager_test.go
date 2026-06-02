@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -545,5 +546,110 @@ func TestTaskManagerWaitMarksAllTasksOperatorStop(t *testing.T) {
 		if !task.StoppedByOperator() {
 			t.Fatalf("Expected task %q to be marked operator-stopped after Wait", task.mapping.Topic)
 		}
+	}
+}
+
+func TestComputeBackoff(t *testing.T) {
+	ar := AutoRestartConfig{InitialBackoffMs: 1000, MaxBackoffMs: 16000}
+	tests := []struct {
+		failures int
+		min, max time.Duration // base .. base+25% jitter
+	}{
+		{1, 1000 * time.Millisecond, 1250 * time.Millisecond},
+		{2, 2000 * time.Millisecond, 2500 * time.Millisecond},
+		{3, 4000 * time.Millisecond, 5000 * time.Millisecond},
+		{5, 16000 * time.Millisecond, 20000 * time.Millisecond},  // capped at max + jitter
+		{50, 16000 * time.Millisecond, 20000 * time.Millisecond}, // stays capped, no overflow
+	}
+	for _, tt := range tests {
+		for i := 0; i < 20; i++ { // sample repeatedly since jitter is random
+			got := computeBackoff(ar, tt.failures)
+			if got < tt.min || got > tt.max {
+				t.Fatalf("computeBackoff(failures=%d) = %s, want within [%s, %s]", tt.failures, got, tt.min, tt.max)
+			}
+		}
+	}
+}
+
+// newSupervisedManager builds a TaskManager with auto-restart enabled (defaults applied)
+// and a single stopped task registered, without touching Kafka or ClickHouse.
+func newSupervisedManager(task *SinkTask) (*TaskManager, *managedTask, context.CancelFunc) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		restart:   make(map[string]*restartTracker),
+		cfg:       cfg,
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+	}
+	mt := &managedTask{task: task, mapping: TopicTableMapping{Topic: task.mapping.Topic}, startedAt: time.Now()}
+	mgr.tasks[task.mapping.Topic] = mt
+	return mgr, mt, cancel
+}
+
+func TestHandleTaskExitLeavesFatalCrashStopped(t *testing.T) {
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	task.stopped.Store(true)
+	task.setStopClass(StopClassFatal)
+
+	mgr, mt, cancel := newSupervisedManager(task)
+	defer cancel()
+
+	mgr.handleTaskExit(mt)
+	if task.NeedsRecycle() {
+		t.Fatal("Expected fatal crash not to be flagged for recycle")
+	}
+}
+
+func TestHandleTaskExitSkipsOperatorStop(t *testing.T) {
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	task.stopped.Store(true)
+	task.setStopClass(StopClassTransient)
+	task.MarkOperatorStop()
+
+	mgr, mt, cancel := newSupervisedManager(task)
+	defer cancel()
+
+	mgr.handleTaskExit(mt)
+	if task.NeedsRecycle() {
+		t.Fatal("Expected operator-stopped task not to be flagged for recycle")
+	}
+}
+
+func TestHandleTaskExitDisabledIsNoop(t *testing.T) {
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	task.stopped.Store(true)
+	task.setStopClass(StopClassTransient)
+
+	mgr, mt, cancel := newSupervisedManager(task)
+	defer cancel()
+	*mgr.cfg.AutoRestart.Enabled = false
+
+	mgr.handleTaskExit(mt)
+	if task.NeedsRecycle() {
+		t.Fatal("Expected disabled supervisor not to flag for recycle")
+	}
+}
+
+func TestHandleTaskExitEscalatesWhenStuck(t *testing.T) {
+	task := &SinkTask{mapping: TopicTableMapping{Topic: "orders"}}
+	task.stopped.Store(true)
+	task.setStopClass(StopClassTransient)
+
+	mgr, mt, cancel := newSupervisedManager(task)
+	defer cancel()
+
+	// Seed a crash-loop window that began past max_stuck_s ago so the next transient
+	// exit escalates to a pod recycle instead of restarting.
+	mgr.restart["orders"] = &restartTracker{
+		failures:       3,
+		firstFailureAt: time.Now().Add(-time.Duration(mgr.cfg.AutoRestart.MaxStuckS+60) * time.Second),
+	}
+
+	mgr.handleTaskExit(mt)
+	if !task.NeedsRecycle() {
+		t.Fatal("Expected task crash-looping past max_stuck_s to be flagged for recycle")
 	}
 }

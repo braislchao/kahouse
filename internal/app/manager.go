@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
@@ -16,10 +18,17 @@ import (
 
 // managedTask tracks a running SinkTask alongside the controls needed to stop or replace it.
 type managedTask struct {
-	task    *SinkTask
-	cancel  context.CancelFunc // cancels the per-task context (external stop)
-	done    chan struct{}      // closed when task.Run returns
-	mapping TopicTableMapping
+	task      *SinkTask
+	cancel    context.CancelFunc // cancels the per-task context (external stop)
+	done      chan struct{}      // closed when task.Run returns
+	mapping   TopicTableMapping
+	startedAt time.Time // when this incarnation of the task was launched
+}
+
+// restartTracker holds the supervisor's per-topic backoff state across task incarnations.
+type restartTracker struct {
+	failures       int       // consecutive transient crashes since the last healthy run
+	firstFailureAt time.Time // start of the current crash-loop window (for MaxStuck escalation)
 }
 
 // TopicStatus is the JSON-serialisable status of a single topic, returned by the admin API.
@@ -28,15 +37,19 @@ type TopicStatus struct {
 	Table      string `json:"table"`
 	Status     string `json:"status"`      // "running" or "stopped"
 	StopReason string `json:"stop_reason"` // "", "operator", or "crash"
+	StopClass  string `json:"stop_class"`  // "", "transient", or "fatal" (only set for crashes)
 	RepairMode string `json:"repair_mode"` // "", "dlq", or "skip"
 }
 
-// TaskManager is a passive supervisor: it launches configured tasks, monitors their state,
-// and provides an HTTP admin API for manual stop, restart, and repair-mode control.
-// It does NOT auto-restart failed tasks.
+// TaskManager launches configured tasks, monitors their state, and provides an HTTP
+// admin API for manual stop, restart, and repair-mode control. When auto-restart is
+// enabled (the default) it also supervises tasks: a task that stops with a transient
+// (recoverable) error is restarted in place with exponential backoff. Fatal crashes
+// (poison messages, non-retriable ClickHouse errors) and operator stops are left alone.
 type TaskManager struct {
 	mu           sync.RWMutex
 	tasks        map[string]*managedTask
+	restart      map[string]*restartTracker // per-topic supervisor backoff state
 	cfg          *Config
 	chConn       driver.Conn
 	srClient     schemaregistry.Client
@@ -59,6 +72,7 @@ func NewTaskManager(
 ) *TaskManager {
 	return &TaskManager{
 		tasks:        make(map[string]*managedTask),
+		restart:      make(map[string]*restartTracker),
 		cfg:          cfg,
 		chConn:       chConn,
 		srClient:     srClient,
@@ -90,10 +104,11 @@ func (m *TaskManager) startTask(mapping TopicTableMapping) error {
 	done := make(chan struct{})
 
 	mt := &managedTask{
-		task:    task,
-		cancel:  taskCancel,
-		done:    done,
-		mapping: mapping,
+		task:      task,
+		cancel:    taskCancel,
+		done:      done,
+		mapping:   mapping,
+		startedAt: time.Now(),
 	}
 
 	m.mu.Lock()
@@ -101,14 +116,130 @@ func (m *TaskManager) startTask(mapping TopicTableMapping) error {
 	m.mu.Unlock()
 
 	go func() {
-		defer close(done)
 		task.Run(taskCtx)
+		close(done)
+		// After the task exits, let the supervisor decide whether to auto-restart it.
+		m.handleTaskExit(mt)
 	}()
 
 	taskStopped.WithLabelValues(mapping.Topic).Set(0)
 
 	m.logger.Infof("Started sink task: topic=%s table=%s format=%s", mapping.Topic, mapping.Table, mapping.Format)
 	return nil
+}
+
+// autoRestartEnabled reports whether the supervisor should act on task exits.
+func (m *TaskManager) autoRestartEnabled() bool {
+	return m.cfg != nil && m.cfg.AutoRestart.Enabled != nil && *m.cfg.AutoRestart.Enabled
+}
+
+// handleTaskExit is invoked on the task goroutine once Run returns. When auto-restart
+// is enabled and the task stopped with a transient (recoverable) error, it waits a
+// backoff interval and relaunches the task in place. Operator stops, graceful shutdown,
+// and fatal crashes are left untouched. If a task keeps crash-looping past
+// auto_restart.max_stuck_s, it is flagged for a pod recycle via /livez.
+func (m *TaskManager) handleTaskExit(mt *managedTask) {
+	if !m.autoRestartEnabled() {
+		return
+	}
+	topic := mt.mapping.Topic
+	// Operator stops and process shutdown are intentional — never auto-restart.
+	if mt.task.StoppedByOperator() || m.parentCtx.Err() != nil {
+		return
+	}
+	// Only transient crashes are eligible; fatal crashes wait for an operator.
+	if mt.task.StopClass() != StopClassTransient {
+		m.logger.Warnf("auto-restart: topic %s stopped (class=%q); leaving stopped for operator intervention", topic, mt.task.StopClass())
+		return
+	}
+
+	ar := m.cfg.AutoRestart
+
+	m.mu.Lock()
+	// Identity guard: bail if this incarnation was already replaced (e.g. operator Restart).
+	if cur, ok := m.tasks[topic]; !ok || cur != mt {
+		m.mu.Unlock()
+		return
+	}
+	tr := m.restart[topic]
+	if tr == nil {
+		tr = &restartTracker{}
+		m.restart[topic] = tr
+	}
+	// Reset the crash-loop window if this incarnation ran healthily long enough.
+	if time.Since(mt.startedAt) >= time.Duration(ar.ResetAfterS)*time.Second {
+		tr.failures = 0
+		tr.firstFailureAt = time.Time{}
+	}
+	if tr.failures == 0 {
+		tr.firstFailureAt = time.Now()
+	}
+	tr.failures++
+	failures := tr.failures
+	stuckFor := time.Since(tr.firstFailureAt)
+	m.mu.Unlock()
+
+	// Backstop: crash-looping past the limit → escalate to a pod recycle via /livez.
+	if ar.MaxStuckS > 0 && stuckFor >= time.Duration(ar.MaxStuckS)*time.Second {
+		mt.task.MarkNeedsRecycle()
+		taskRecycleEscalationsTotal.WithLabelValues(topic).Inc()
+		m.logger.Errorf("auto-restart: topic %s still crashing after %s (%d attempts); escalating to pod recycle via /livez",
+			topic, stuckFor.Round(time.Second), failures)
+		return
+	}
+
+	backoff := computeBackoff(ar, failures)
+	m.logger.Warnf("auto-restart: topic %s crashed (transient); scheduling restart #%d in %s", topic, failures, backoff.Round(time.Millisecond))
+
+	select {
+	case <-time.After(backoff):
+	case <-m.parentCtx.Done():
+		return
+	}
+
+	// Re-check identity and shutdown state before relaunching.
+	m.mu.RLock()
+	cur, ok := m.tasks[topic]
+	m.mu.RUnlock()
+	if !ok || cur != mt || m.parentCtx.Err() != nil {
+		return
+	}
+
+	taskAutoRestartsTotal.WithLabelValues(topic).Inc()
+	m.logger.Infof("auto-restart: restarting sink task for topic %s (attempt #%d)", topic, failures)
+	if err := m.startTask(mt.mapping); err != nil {
+		// No new task will be launched, so the topic would silently stay dead.
+		// Flag for a pod recycle so the process is replaced instead.
+		m.logger.Errorf("auto-restart: failed to restart topic %s: %v — escalating to pod recycle", topic, err)
+		mt.task.MarkNeedsRecycle()
+		taskRecycleEscalationsTotal.WithLabelValues(topic).Inc()
+	}
+}
+
+// computeBackoff returns the delay before restart attempt number `failures`
+// (1-based): exponential from InitialBackoffMs, doubling per failure, capped at
+// MaxBackoffMs, plus up to 25% jitter to avoid synchronized restarts across topics.
+func computeBackoff(ar AutoRestartConfig, failures int) time.Duration {
+	initial := time.Duration(ar.InitialBackoffMs) * time.Millisecond
+	maxBackoff := time.Duration(ar.MaxBackoffMs) * time.Millisecond
+	if initial <= 0 {
+		initial = time.Second
+	}
+	if maxBackoff < initial {
+		maxBackoff = initial
+	}
+	d := initial
+	for i := 1; i < failures && d < maxBackoff; i++ {
+		d *= 2
+		if d >= maxBackoff {
+			d = maxBackoff
+			break
+		}
+	}
+	if d > 0 {
+		d += time.Duration(rand.Int63n(int64(d)/4 + 1))
+	}
+	return d
 }
 
 // Stop gracefully stops the task for the given topic.
@@ -210,12 +341,14 @@ func (m *TaskManager) Topics() []TopicStatus {
 	for _, mt := range m.tasks {
 		status := "running"
 		stopReason := ""
+		stopClass := ""
 		if mt.task.IsStopped() {
 			status = "stopped"
 			if mt.task.StoppedByOperator() {
 				stopReason = "operator"
 			} else {
 				stopReason = "crash"
+				stopClass = mt.task.StopClass().String()
 			}
 		}
 		result = append(result, TopicStatus{
@@ -223,6 +356,7 @@ func (m *TaskManager) Topics() []TopicStatus {
 			Table:      mt.mapping.Table,
 			Status:     status,
 			StopReason: stopReason,
+			StopClass:  stopClass,
 			RepairMode: mt.task.GetRepairMode().String(),
 		})
 	}

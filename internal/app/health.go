@@ -15,6 +15,7 @@ import (
 type sinkHealthChecker interface {
 	IsStopped() bool
 	StoppedByOperator() bool
+	NeedsRecycle() bool
 	TopicName() string
 	Assignment() ([]kafka.TopicPartition, error)
 }
@@ -37,10 +38,16 @@ func NewHealth(logger *zap.SugaredLogger, chConn driver.Conn, tasks func() []sin
 	}
 }
 
-// Livez handler returns 200 unless every sink task has stopped AND at least one
-// stopped unexpectedly (i.e. without an operator-initiated stop). Operator-initiated
-// stops (admin API Stop/Restart, SIGTERM) keep /livez at 200 so kubelet does not
-// kill the pod during maintenance or graceful shutdown.
+// Livez handler returns 200 unless either:
+//   - the supervisor has flagged a task for recycle (it exhausted auto-restart for a
+//     transient crash), or
+//   - every sink task has stopped AND at least one stopped unexpectedly (i.e. without
+//     an operator-initiated stop).
+//
+// Operator-initiated stops (admin API Stop/Restart, SIGTERM) keep /livez at 200 so
+// kubelet does not kill the pod during maintenance or graceful shutdown. A single
+// transient crash does NOT fail liveness on its own — the supervisor restarts it in
+// place; liveness only fails once the supervisor gives up (pod recycle as last resort).
 func (h *Health) Livez(w http.ResponseWriter, r *http.Request) {
 	if h.livenessShouldFail() {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -66,6 +73,11 @@ func (h *Health) livenessShouldFail() bool {
 	allStopped := true
 	anyCrashed := false
 	for _, task := range tasks {
+		// Backstop: the supervisor exhausted auto-restart for a transient crash and
+		// asked for a pod recycle. Fail liveness so kubelet replaces the pod.
+		if task.NeedsRecycle() {
+			return true
+		}
 		if !task.IsStopped() {
 			allStopped = false
 			continue

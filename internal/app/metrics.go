@@ -60,6 +60,16 @@ var (
 		Name:      "task_restarts_total",
 		Help:      "Total number of times a sink task has been restarted via the admin API",
 	}, []string{"topic"})
+	taskAutoRestartsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "kahouse",
+		Name:      "task_auto_restarts_total",
+		Help:      "Total number of times the supervisor automatically restarted a transiently-crashed sink task",
+	}, []string{"topic"})
+	taskRecycleEscalationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "kahouse",
+		Name:      "task_recycle_escalations_total",
+		Help:      "Total number of times the supervisor gave up auto-restarting a task and escalated to a pod recycle via liveness",
+	}, []string{"topic"})
 	startAtAppliedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "kahouse",
 		Name:      "start_at_applied_total",
@@ -79,6 +89,8 @@ func init() {
 		retryCountHist,
 		taskStopped,
 		taskRestartsTotal,
+		taskAutoRestartsTotal,
+		taskRecycleEscalationsTotal,
 		startAtAppliedTotal,
 	)
 }
