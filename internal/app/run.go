@@ -78,6 +78,11 @@ func Run() {
 	}
 	chOptions.MaxOpenConns = cfg.ClickHouseMaxOpenConns
 	chOptions.MaxIdleConns = cfg.ClickHouseMaxIdleConns
+	// Recycle connections before ClickHouse Cloud closes them server-side, otherwise the
+	// pool serves dead connections ("connection reset by peer" / "failed to read packet").
+	if cfg.ClickHouseConnMaxLifetimeS > 0 {
+		chOptions.ConnMaxLifetime = time.Duration(cfg.ClickHouseConnMaxLifetimeS) * time.Second
+	}
 	chConn, err := clickhouse.Open(chOptions)
 	if err != nil {
 		sugar.Errorf("Failed to open ClickHouse connection: %v", err)

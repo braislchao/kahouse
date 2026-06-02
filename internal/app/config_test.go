@@ -420,8 +420,17 @@ func TestValidateConfigClickHousePoolSettings(t *testing.T) {
 			want:   "clickhouse_max_idle_conns must be at least 1",
 		},
 		{
-			name:   "valid pool settings accepted",
-			mutate: func(c *Config) { c.ClickHouseMaxOpenConns = 10; c.ClickHouseMaxIdleConns = 3 },
+			name:   "conn_max_lifetime_s negative rejected",
+			mutate: func(c *Config) { c.ClickHouseConnMaxLifetimeS = -1 },
+			want:   "clickhouse_conn_max_lifetime_s must be >= 0",
+		},
+		{
+			name: "valid pool settings accepted",
+			mutate: func(c *Config) {
+				c.ClickHouseMaxOpenConns = 10
+				c.ClickHouseMaxIdleConns = 3
+				c.ClickHouseConnMaxLifetimeS = 0
+			},
 		},
 	}
 
@@ -525,6 +534,7 @@ func TestConfigLogFieldsIncludesNewFields(t *testing.T) {
 		AutoOffsetReset:              "earliest",
 		ClickHouseMaxOpenConns:       10,
 		ClickHouseMaxIdleConns:       5,
+		ClickHouseConnMaxLifetimeS:   300,
 		ClickHouseAsyncInsert:        true,
 		ClickHouseWaitForAsyncInsert: false,
 		KafkaSessionTimeoutMs:        45000,
@@ -565,6 +575,10 @@ func TestConfigLogFieldsIncludesNewFields(t *testing.T) {
 	if got := fieldMap["clickhouse_wait_for_async_insert"]; got != false {
 		t.Fatalf("Expected clickhouse_wait_for_async_insert=false, got %v", got)
 	}
+
+	if got := fieldMap["clickhouse_conn_max_lifetime_s"]; got != 300 {
+		t.Fatalf("Expected clickhouse_conn_max_lifetime_s=300, got %v", got)
+	}
 }
 
 func TestApplyDefaultsNewFields(t *testing.T) {
@@ -585,6 +599,16 @@ func TestApplyDefaultsNewFields(t *testing.T) {
 	}
 	if cfg.AutoOffsetReset != "earliest" {
 		t.Fatalf("Expected default auto_offset_reset=earliest, got %q", cfg.AutoOffsetReset)
+	}
+	if cfg.ClickHouseConnMaxLifetimeS != 300 {
+		t.Fatalf("Expected default clickhouse_conn_max_lifetime_s=300, got %d", cfg.ClickHouseConnMaxLifetimeS)
+	}
+
+	// An explicitly-set lifetime is respected, not overwritten by the default.
+	explicit := &Config{ClickHouseConnMaxLifetimeS: 60}
+	applyDefaults(explicit)
+	if explicit.ClickHouseConnMaxLifetimeS != 60 {
+		t.Fatalf("Expected explicit clickhouse_conn_max_lifetime_s=60, got %d", explicit.ClickHouseConnMaxLifetimeS)
 	}
 }
 

@@ -30,6 +30,10 @@ metrics_port: 9090
 # ClickHouse connection pool
 clickhouse_max_open_conns: 5
 clickhouse_max_idle_conns: 5
+# Recycle pooled connections after this many seconds. ClickHouse Cloud closes idle
+# connections server-side; the driver default (1h) is far too long and leads to
+# "connection reset by peer" on stale connections. Keep below the server idle timeout.
+clickhouse_conn_max_lifetime_s: 300
 
 # ClickHouse async insert settings (opt-in, both default to false)
 # clickhouse_async_insert: true
