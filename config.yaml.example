@@ -49,6 +49,20 @@ batch_delay_ms: 200
 max_retries: 5
 retry_backoff_ms: 100
 
+# Auto-restart supervision.
+# When a sink task stops with a *transient* error (ClickHouse timeout / retriable
+# error, transient Kafka commit failure), the supervisor restarts it in place with
+# exponential backoff instead of leaving it stopped until an operator intervenes.
+# Fatal crashes (poison messages in strict mode, non-retriable ClickHouse errors)
+# are never auto-restarted. If a task keeps crash-looping past max_stuck_s, the
+# supervisor gives up and fails /livez so Kubernetes recycles the whole pod.
+auto_restart:
+  enabled: true            # default true; set false to keep the old passive behaviour
+  initial_backoff_ms: 5000 # delay before the first restart; doubles each consecutive failure
+  max_backoff_ms: 300000   # cap on the restart backoff (5 min)
+  reset_after_s: 120       # healthy uptime that resets a task's consecutive-failure counter
+  max_stuck_s: 900         # escalate to a pod recycle after this long crash-looping (negative disables)
+
 # For avro input, schema_registry must point at a Confluent-compatible Schema Registry.
 # For json and string input, schema_registry is unused.
 

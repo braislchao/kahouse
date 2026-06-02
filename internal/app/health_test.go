@@ -16,6 +16,7 @@ import (
 type stubSinkChecker struct {
 	stopped           bool
 	stoppedByOperator bool
+	needsRecycle      bool
 	topic             string
 	assignment        []kafka.TopicPartition
 	err               error
@@ -23,6 +24,7 @@ type stubSinkChecker struct {
 
 func (s stubSinkChecker) IsStopped() bool                             { return s.stopped }
 func (s stubSinkChecker) StoppedByOperator() bool                     { return s.stoppedByOperator }
+func (s stubSinkChecker) NeedsRecycle() bool                          { return s.needsRecycle }
 func (s stubSinkChecker) TopicName() string                           { return s.topic }
 func (s stubSinkChecker) Assignment() ([]kafka.TopicPartition, error) { return s.assignment, s.err }
 
@@ -156,6 +158,14 @@ func TestHealthLivenessAllStopped(t *testing.T) {
 				stubSinkChecker{topic: "payments"},
 			},
 			want: http.StatusOK,
+		},
+		{
+			name: "task flagged for recycle returns 503 even with others running",
+			tasks: []sinkHealthChecker{
+				stubSinkChecker{topic: "orders", stopped: true, needsRecycle: true},
+				stubSinkChecker{topic: "payments"},
+			},
+			want: http.StatusServiceUnavailable,
 		},
 		{
 			name: "all running returns 200",

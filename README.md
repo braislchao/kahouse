@@ -118,6 +118,16 @@ Write failures are retried with exponential backoff. If all retries are exhauste
 
 Decode errors (bad JSON, schema mismatch, corrupted payload) also **stop the task** by default. This is intentional, bad data should be investigated. When the cause is known and you need to unblock consumption, use repair mode.
 
+### Auto-restart
+
+By default a supervisor distinguishes *why* a task stopped and acts accordingly:
+
+- **Transient** stops — ClickHouse timeout / retriable error, transient Kafka commit failure — are **restarted in place** with exponential backoff (`auto_restart.initial_backoff_ms` doubling up to `max_backoff_ms`). Each topic has its own consumer group, so a restart does not rebalance other topics. This lets the service ride out a slow or briefly unavailable ClickHouse without manual intervention.
+- **Fatal** stops — poison message in strict mode, non-retriable ClickHouse error (e.g. schema mismatch) — are **left stopped** for an operator, exactly as before. A restart cannot fix them.
+- If a task keeps crash-looping past `auto_restart.max_stuck_s`, the supervisor gives up and fails `/livez` so Kubernetes recycles the whole pod as a last resort.
+
+Set `auto_restart.enabled: false` to keep the previous passive behavior (crashed tasks stay stopped until restarted via the admin API). See [`docs/configuration.md`](docs/configuration.md) for all knobs.
+
 ### Repair mode
 
 Enable repair mode per topic via the [admin API](#admin-api):
@@ -156,8 +166,8 @@ Default port is `9090` (configurable via `metrics_port`).
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /livez` | Returns 200 unless every task has stopped AND at least one stopped unexpectedly. Operator-initiated stops (admin API stop/restart, SIGTERM) keep `/livez` at 200, so kubelet does not kill the pod during maintenance or graceful shutdown. |
-| `GET /readyz` | Returns 200 if ClickHouse is reachable and all consumers have partition assignments |
+| `GET /livez` | Returns 200 unless (a) the supervisor flagged a task for recycle after exhausting auto-restart, or (b) every task has stopped AND at least one stopped unexpectedly. Operator-initiated stops (admin API stop/restart, SIGTERM) keep `/livez` at 200, so kubelet does not kill the pod during maintenance or graceful shutdown. A single transient crash does not fail `/livez` — the supervisor restarts it in place. |
+| `GET /readyz` | Returns 200 if ClickHouse is reachable and all consumers have partition assignments (so a task stopped or crash-looping makes the pod NotReady) |
 | `GET /metrics` | Prometheus metrics |
 
 ### Admin API
@@ -176,8 +186,9 @@ Operational endpoints for managing individual topics at runtime.
 ```bash
 # Check which topics are running
 curl http://localhost:9090/api/topics
-# -> [{"topic":"orders","table":"default.orders","status":"stopped","stop_reason":"crash","repair_mode":""}, ...]
+# -> [{"topic":"orders","table":"default.orders","status":"stopped","stop_reason":"crash","stop_class":"transient","repair_mode":""}, ...]
 # stop_reason is "operator" (admin API stop/restart or SIGTERM), "crash" (unexpected exit), or "" (running).
+# stop_class refines a crash: "transient" (auto-restart eligible) or "fatal" (needs an operator); "" otherwise.
 
 # Start a stopped topic
 curl -X POST http://localhost:9090/api/topics/orders/start
@@ -201,6 +212,8 @@ All metrics are labeled by `topic`.
 | `kahouse_msg_dlq_total` | Counter | Messages forwarded to DLQ |
 | `kahouse_task_stopped` | Gauge | 1 = stopped, 0 = running |
 | `kahouse_task_restarts_total` | Counter | Admin API restarts |
+| `kahouse_task_auto_restarts_total` | Counter | Supervisor auto-restarts of transiently-crashed tasks |
+| `kahouse_task_recycle_escalations_total` | Counter | Times the supervisor gave up and escalated to a pod recycle via `/livez` |
 | `kahouse_batch_size` | Histogram | Records per flushed batch |
 | `kahouse_batch_delay_seconds` | Histogram | Age of oldest record in batch at flush time |
 | `kahouse_process_latency_seconds` | Histogram | ClickHouse write duration (includes retries) |

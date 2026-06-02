@@ -4,8 +4,6 @@ import (
 	"testing"
 )
 
-func boolPtr(b bool) *bool { return &b }
-
 func TestFlattenRecord(t *testing.T) {
 	tests := []struct {
 		name           string

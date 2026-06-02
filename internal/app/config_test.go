@@ -455,6 +455,58 @@ func TestValidateConfigClickHousePoolSettings(t *testing.T) {
 	}
 }
 
+func TestValidateConfigAutoRestartSettings(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "initial_backoff_ms negative rejected",
+			mutate: func(c *Config) { c.AutoRestart.InitialBackoffMs = -1 },
+			want:   "auto_restart.initial_backoff_ms must be >= 0",
+		},
+		{
+			name:   "max_backoff_ms below initial rejected",
+			mutate: func(c *Config) { c.AutoRestart.InitialBackoffMs = 5000; c.AutoRestart.MaxBackoffMs = 1000 },
+			want:   "auto_restart.max_backoff_ms",
+		},
+		{
+			name:   "reset_after_s negative rejected",
+			mutate: func(c *Config) { c.AutoRestart.ResetAfterS = -1 },
+			want:   "auto_restart.reset_after_s must be >= 0",
+		},
+		{
+			name: "valid auto_restart settings accepted",
+			mutate: func(c *Config) {
+				c.AutoRestart.InitialBackoffMs = 5000
+				c.AutoRestart.MaxBackoffMs = 300000
+				c.AutoRestart.ResetAfterS = 120
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := validateConfig(&cfg)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("Expected config to validate, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Expected validation error containing %q", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Expected error containing %q, got %q", tt.want, err.Error())
+			}
+		})
+	}
+}
+
 func TestValidateConfigKafkaTimeoutSettings(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -542,6 +594,7 @@ func TestConfigLogFieldsIncludesNewFields(t *testing.T) {
 		BatchDelayMs:                 intPtr(200),
 		MaxRetries:                   intPtr(5),
 		RetryBackoffMs:               intPtr(100),
+		AutoRestart:                  AutoRestartConfig{Enabled: boolPtr(true), InitialBackoffMs: 5000, MaxBackoffMs: 300000, ResetAfterS: 120, MaxStuckS: 900},
 		TopicTables:                  []TopicTableMapping{{Topic: "orders", Table: "default.orders"}},
 	}
 
@@ -579,6 +632,9 @@ func TestConfigLogFieldsIncludesNewFields(t *testing.T) {
 	if got := fieldMap["clickhouse_conn_max_lifetime_s"]; got != 300 {
 		t.Fatalf("Expected clickhouse_conn_max_lifetime_s=300, got %v", got)
 	}
+	if got := fieldMap["auto_restart_enabled"]; got != true {
+		t.Fatalf("Expected auto_restart_enabled=true, got %v", got)
+	}
 }
 
 func TestApplyDefaultsNewFields(t *testing.T) {
@@ -603,12 +659,34 @@ func TestApplyDefaultsNewFields(t *testing.T) {
 	if cfg.ClickHouseConnMaxLifetimeS != 300 {
 		t.Fatalf("Expected default clickhouse_conn_max_lifetime_s=300, got %d", cfg.ClickHouseConnMaxLifetimeS)
 	}
+	if cfg.AutoRestart.Enabled == nil || !*cfg.AutoRestart.Enabled {
+		t.Fatal("Expected auto_restart enabled by default")
+	}
+	if cfg.AutoRestart.InitialBackoffMs != 5000 {
+		t.Fatalf("Expected default auto_restart.initial_backoff_ms=5000, got %d", cfg.AutoRestart.InitialBackoffMs)
+	}
+	if cfg.AutoRestart.MaxBackoffMs != 300000 {
+		t.Fatalf("Expected default auto_restart.max_backoff_ms=300000, got %d", cfg.AutoRestart.MaxBackoffMs)
+	}
+	if cfg.AutoRestart.ResetAfterS != 120 {
+		t.Fatalf("Expected default auto_restart.reset_after_s=120, got %d", cfg.AutoRestart.ResetAfterS)
+	}
+	if cfg.AutoRestart.MaxStuckS != 900 {
+		t.Fatalf("Expected default auto_restart.max_stuck_s=900, got %d", cfg.AutoRestart.MaxStuckS)
+	}
 
 	// An explicitly-set lifetime is respected, not overwritten by the default.
 	explicit := &Config{ClickHouseConnMaxLifetimeS: 60}
 	applyDefaults(explicit)
 	if explicit.ClickHouseConnMaxLifetimeS != 60 {
 		t.Fatalf("Expected explicit clickhouse_conn_max_lifetime_s=60, got %d", explicit.ClickHouseConnMaxLifetimeS)
+	}
+
+	// An explicit auto_restart disable is respected, not overwritten by the default.
+	disabled := &Config{AutoRestart: AutoRestartConfig{Enabled: boolPtr(false)}}
+	applyDefaults(disabled)
+	if disabled.AutoRestart.Enabled == nil || *disabled.AutoRestart.Enabled {
+		t.Fatal("Expected explicit auto_restart disable to be respected")
 	}
 }
 

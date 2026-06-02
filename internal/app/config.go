@@ -164,11 +164,39 @@ type Config struct {
 	// Shutdown timeout (seconds) for flushing remaining batches and stopping the HTTP server
 	ShutdownTimeoutS int `yaml:"shutdown_timeout_s"`
 
+	// Auto-restart supervision for transiently-crashed sink tasks.
+	AutoRestart AutoRestartConfig `yaml:"auto_restart"`
+
 	TopicTables []TopicTableMapping `yaml:"topic_tables"`
+}
+
+// AutoRestartConfig controls the TaskManager supervisor that restarts sink tasks
+// which stop with a transient (recoverable) error, instead of leaving them stopped
+// until an operator intervenes. Crashes classified as fatal (poison messages in
+// strict mode, non-retriable ClickHouse errors) are never auto-restarted.
+type AutoRestartConfig struct {
+	// Enabled turns the supervisor on. Nil defaults to true.
+	Enabled *bool `yaml:"enabled"`
+	// InitialBackoffMs is the delay before the first restart; it doubles each
+	// consecutive failure up to MaxBackoffMs (with jitter).
+	InitialBackoffMs int `yaml:"initial_backoff_ms"`
+	// MaxBackoffMs caps the restart backoff.
+	MaxBackoffMs int `yaml:"max_backoff_ms"`
+	// ResetAfterS is the healthy uptime after which a restarted task's consecutive
+	// failure counter is reset to zero.
+	ResetAfterS int `yaml:"reset_after_s"`
+	// MaxStuckS is the longest a task may keep crash-looping before the supervisor
+	// gives up and escalates to a pod recycle via /livez. A negative value disables
+	// escalation (the supervisor keeps retrying with capped backoff forever). 0 means
+	// "use the default".
+	MaxStuckS int `yaml:"max_stuck_s"`
 }
 
 // intPtr returns a pointer to a copy of v.
 func intPtr(v int) *int { return &v }
+
+// boolPtr returns a pointer to a copy of v.
+func boolPtr(v bool) *bool { return &v }
 
 // resolve fills nil pointer fields from global defaults.
 // A nil pointer means "not configured by the user"; a non-nil pointer (including *0) is respected.
@@ -268,6 +296,21 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.ShutdownTimeoutS == 0 {
 		cfg.ShutdownTimeoutS = 5
+	}
+	if cfg.AutoRestart.Enabled == nil {
+		cfg.AutoRestart.Enabled = boolPtr(true)
+	}
+	if cfg.AutoRestart.InitialBackoffMs == 0 {
+		cfg.AutoRestart.InitialBackoffMs = 5000
+	}
+	if cfg.AutoRestart.MaxBackoffMs == 0 {
+		cfg.AutoRestart.MaxBackoffMs = 300000 // 5 min
+	}
+	if cfg.AutoRestart.ResetAfterS == 0 {
+		cfg.AutoRestart.ResetAfterS = 120
+	}
+	if cfg.AutoRestart.MaxStuckS == 0 {
+		cfg.AutoRestart.MaxStuckS = 900 // 15 min, then escalate to pod recycle
 	}
 }
 
@@ -374,6 +417,15 @@ func validateConfig(cfg *Config) error {
 	if cfg.ShutdownTimeoutS <= 0 {
 		return fmt.Errorf("shutdown_timeout_s must be > 0, got %d", cfg.ShutdownTimeoutS)
 	}
+	if cfg.AutoRestart.InitialBackoffMs < 0 {
+		return fmt.Errorf("auto_restart.initial_backoff_ms must be >= 0, got %d", cfg.AutoRestart.InitialBackoffMs)
+	}
+	if cfg.AutoRestart.MaxBackoffMs < cfg.AutoRestart.InitialBackoffMs {
+		return fmt.Errorf("auto_restart.max_backoff_ms (%d) must be >= initial_backoff_ms (%d)", cfg.AutoRestart.MaxBackoffMs, cfg.AutoRestart.InitialBackoffMs)
+	}
+	if cfg.AutoRestart.ResetAfterS < 0 {
+		return fmt.Errorf("auto_restart.reset_after_s must be >= 0, got %d", cfg.AutoRestart.ResetAfterS)
+	}
 	if len(cfg.TopicTables) == 0 {
 		return fmt.Errorf("at least one topic_tables mapping is required")
 	}
@@ -470,6 +522,11 @@ func configLogFields(cfg *Config) []interface{} {
 		"kafka_session_timeout_ms", cfg.KafkaSessionTimeoutMs,
 		"kafka_max_poll_interval_ms", cfg.KafkaMaxPollIntervalMs,
 		"shutdown_timeout_s", cfg.ShutdownTimeoutS,
+		"auto_restart_enabled", cfg.AutoRestart.Enabled != nil && *cfg.AutoRestart.Enabled,
+		"auto_restart_initial_backoff_ms", cfg.AutoRestart.InitialBackoffMs,
+		"auto_restart_max_backoff_ms", cfg.AutoRestart.MaxBackoffMs,
+		"auto_restart_reset_after_s", cfg.AutoRestart.ResetAfterS,
+		"auto_restart_max_stuck_s", cfg.AutoRestart.MaxStuckS,
 		"topic_tables", cfg.TopicTables,
 	}
 }

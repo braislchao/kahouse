@@ -54,6 +54,24 @@ These fields have defaults for local development, but you will always set them e
 |-------|------|---------|-------------|
 | `metrics_port` | int | `9090` | HTTP port for health endpoints, admin API, and Prometheus metrics. |
 
+### Auto-restart
+
+Supervises sink tasks: a task that stops with a **transient** (recoverable) error is
+restarted in place with exponential backoff, instead of staying stopped until an
+operator intervenes. **Fatal** crashes (poison messages in strict mode, non-retriable
+ClickHouse errors) are never auto-restarted. Configured under the `auto_restart` key.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `auto_restart.enabled` | bool | `true` | Master switch. `false` restores the passive behavior (crashed tasks stay stopped until an admin-API restart). |
+| `auto_restart.initial_backoff_ms` | int | `5000` | Delay before the first restart; doubles each consecutive failure. Must be >= 0. |
+| `auto_restart.max_backoff_ms` | int | `300000` | Cap on the restart backoff. Must be >= `initial_backoff_ms`. |
+| `auto_restart.reset_after_s` | int | `120` | Healthy uptime after which a restarted task's consecutive-failure counter resets to zero. Must be >= 0. |
+| `auto_restart.max_stuck_s` | int | `900` | If a task keeps crash-looping this long, the supervisor gives up and fails `/livez` so Kubernetes recycles the pod. A negative value disables escalation. |
+
+A restart re-reads from the last committed Kafka offset; because offsets are committed
+only after a successful write, no data is lost (at-least-once, same as a manual restart).
+
 ### ClickHouse connection
 
 | Field | Type | Default | Description |
@@ -273,6 +291,7 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `kafka_session_timeout_ms` and `kafka_max_poll_interval_ms` must be > 0.
 - `batch_size` must be >= 1 (both global and per-topic).
 - `batch_delay_ms`, `max_retries`, `retry_backoff_ms` must be >= 0.
+- `auto_restart.initial_backoff_ms` and `auto_restart.reset_after_s` must be >= 0; `auto_restart.max_backoff_ms` must be >= `initial_backoff_ms`.
 - `topic_tables` must have at least one entry.
 - Each topic must have a non-empty `topic` and `table`.
 - Topic names must be unique -- duplicates are rejected.

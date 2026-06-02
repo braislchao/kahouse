@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -55,6 +56,36 @@ func ParseRepairMode(s string) (RepairMode, error) {
 	}
 }
 
+// StopClass classifies why a task stopped, so the TaskManager's supervisor can
+// decide whether an automatic restart is safe.
+type StopClass int32
+
+const (
+	// StopClassUnknown is the zero value: the task is running, was stopped by an
+	// operator, or stopped without a classified reason.
+	StopClassUnknown StopClass = iota
+	// StopClassTransient marks a stop caused by a recoverable condition (ClickHouse
+	// timeout / retriable error, transient Kafka commit failure). A fresh task is
+	// likely to succeed once the dependency recovers, so auto-restart is eligible.
+	StopClassTransient
+	// StopClassFatal marks a stop that a restart cannot fix on its own (poison
+	// message in strict mode, non-retriable ClickHouse error). These require an
+	// operator (e.g. set a repair mode) and are never auto-restarted.
+	StopClassFatal
+)
+
+// String returns the lower-case name of the stop class, used in the admin API.
+func (c StopClass) String() string {
+	switch c {
+	case StopClassTransient:
+		return "transient"
+	case StopClassFatal:
+		return "fatal"
+	default:
+		return ""
+	}
+}
+
 // SinkTask represents a single topic-to-table sink pipeline.
 // Each task has its own lifecycle: when it encounters an unrecoverable error it stops
 // itself without affecting other tasks running in the same process.
@@ -68,6 +99,8 @@ type SinkTask struct {
 	sugar                         *zap.SugaredLogger
 	stopped                       atomic.Bool
 	stoppedByOperator             atomic.Bool
+	stopClass                     atomic.Int32 // StopClass: why the task stopped (for the supervisor)
+	needsRecycle                  atomic.Bool  // set by the supervisor when auto-restart gives up
 	repairMode                    atomic.Int32
 	asyncInsert                   bool
 	waitForAsyncInsert            bool
@@ -94,6 +127,30 @@ func (t *SinkTask) StoppedByOperator() bool {
 // before cancel() so /livez never observes a stopped task without the flag set.
 func (t *SinkTask) MarkOperatorStop() {
 	t.stoppedByOperator.Store(true)
+}
+
+// setStopClass records why the task is stopping. It is called from Run (and its
+// flush helper) before returning, so the value is visible once Run exits.
+func (t *SinkTask) setStopClass(c StopClass) {
+	t.stopClass.Store(int32(c))
+}
+
+// StopClass reports the classified reason the task stopped. It is meaningful only
+// once IsStopped() is true.
+func (t *SinkTask) StopClass() StopClass {
+	return StopClass(t.stopClass.Load())
+}
+
+// MarkNeedsRecycle is called by the supervisor when it has given up auto-restarting
+// a transiently-crashing task. It makes /livez fail so the pod is recycled as a
+// last resort.
+func (t *SinkTask) MarkNeedsRecycle() {
+	t.needsRecycle.Store(true)
+}
+
+// NeedsRecycle reports whether the supervisor has escalated this task to a pod recycle.
+func (t *SinkTask) NeedsRecycle() bool {
+	return t.needsRecycle.Load()
 }
 
 func (t *SinkTask) TopicName() string {
@@ -285,6 +342,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 			t.sugar.Warn("Received tombstone message (nil value), committing offset and skipping")
 			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after tombstone: %v", commitErr)
+				t.setStopClass(StopClassTransient)
 				return
 			}
 			continue
@@ -299,10 +357,12 @@ func (t *SinkTask) Run(ctx context.Context) {
 			switch mode {
 			case RepairModeOff:
 				t.sugar.Errorf("Decode error in strict mode, stopping task for topic %s", topic)
+				t.setStopClass(StopClassFatal)
 				return
 			case RepairModeDLQ:
 				if dlqErr := sendToDLQ(t.dlqProducer, topic, t.dlqTopicSuffix, msg.Key, msg.Value, err.Error()); dlqErr != nil {
 					t.sugar.Errorf("Failed to send message to DLQ: %v", dlqErr)
+					t.setStopClass(StopClassFatal)
 					return
 				}
 				msgDLQ.WithLabelValues(topic).Inc()
@@ -313,6 +373,7 @@ func (t *SinkTask) Run(ctx context.Context) {
 
 			if _, commitErr := t.consumer.CommitMessage(msg); commitErr != nil {
 				t.sugar.Errorf("Failed to commit offset after decode error: %v", commitErr)
+				t.setStopClass(StopClassTransient)
 				return
 			}
 			continue
@@ -364,10 +425,13 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 
 	if writeErr != nil {
 		msgFailed.WithLabelValues(topic).Add(float64(len(batch)))
+		class := classifyWriteError(writeErr)
+		t.setStopClass(class)
 		t.sugar.Errorw("Batch write failed",
 			"error", writeErr,
 			"batch_size", len(batch),
 			"attempts", attempts,
+			"stop_class", class.String(),
 			"flush_duration_ms", time.Since(flushStart).Milliseconds(),
 			"prepare_ms", timing.Prepare.Milliseconds(),
 			"append_ms", timing.Append.Milliseconds(),
@@ -412,6 +476,24 @@ func (t *SinkTask) flush(ctx context.Context, table string, batch []map[string]i
 		"commit_ms", commitDuration.Milliseconds(),
 	)
 	return true
+}
+
+// classifyWriteError maps a final batch-write error to a StopClass. A flush that
+// timed out (context deadline) or failed with a retriable ClickHouse error is
+// transient — a fresh task is likely to succeed once ClickHouse recovers, which is
+// exactly the ClickHouse-memory-pressure failure mode. Anything else (e.g. a schema
+// mismatch) is treated as fatal and left for an operator.
+func classifyWriteError(err error) StopClass {
+	if err == nil {
+		return StopClassUnknown
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return StopClassTransient
+	}
+	if isRetriableClickHouseError(err) {
+		return StopClassTransient
+	}
+	return StopClassFatal
 }
 
 // writeWithRetries attempts to write the batch, retrying with exponential backoff+jitter.
