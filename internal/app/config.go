@@ -140,6 +140,12 @@ type Config struct {
 	// ClickHouse connection pool
 	ClickHouseMaxOpenConns int `yaml:"clickhouse_max_open_conns"`
 	ClickHouseMaxIdleConns int `yaml:"clickhouse_max_idle_conns"`
+	// ClickHouseConnMaxLifetimeS recycles pooled connections after this many seconds.
+	// ClickHouse Cloud (and its load balancer) closes idle connections server-side; the
+	// clickhouse-go default of 1h is far too long, so the pool hands out dead connections
+	// ("connection reset by peer" / "failed to read packet"). Keep this comfortably below
+	// the server idle timeout. Must be >= 0; 0 falls back to the default.
+	ClickHouseConnMaxLifetimeS int `yaml:"clickhouse_conn_max_lifetime_s"`
 
 	// ClickHouse async insert settings
 	ClickHouseAsyncInsert        bool `yaml:"clickhouse_async_insert"`
@@ -249,6 +255,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.ClickHouseMaxIdleConns == 0 {
 		cfg.ClickHouseMaxIdleConns = 5
 	}
+	if cfg.ClickHouseConnMaxLifetimeS == 0 {
+		cfg.ClickHouseConnMaxLifetimeS = 300 // 5 min; ClickHouse Cloud closes idle conns well before the 1h driver default
+	}
 	// ClickHouseAsyncInsert and ClickHouseWaitForAsyncInsert default to false (zero value for bool).
 	// This is intentional: async inserts are opt-in.
 	if cfg.KafkaSessionTimeoutMs == 0 {
@@ -340,6 +349,9 @@ func validateConfig(cfg *Config) error {
 	}
 	if cfg.ClickHouseMaxIdleConns < 1 {
 		return fmt.Errorf("clickhouse_max_idle_conns must be at least 1, got %d", cfg.ClickHouseMaxIdleConns)
+	}
+	if cfg.ClickHouseConnMaxLifetimeS < 0 {
+		return fmt.Errorf("clickhouse_conn_max_lifetime_s must be >= 0, got %d", cfg.ClickHouseConnMaxLifetimeS)
 	}
 	if cfg.BatchSize < 1 {
 		return fmt.Errorf("batch_size must be at least 1, got %d", cfg.BatchSize)
@@ -437,6 +449,7 @@ func configLogFields(cfg *Config) []interface{} {
 		"clickhouse_dsn", redactDSN(cfg.ClickHouseDSN),
 		"clickhouse_max_open_conns", cfg.ClickHouseMaxOpenConns,
 		"clickhouse_max_idle_conns", cfg.ClickHouseMaxIdleConns,
+		"clickhouse_conn_max_lifetime_s", cfg.ClickHouseConnMaxLifetimeS,
 		"clickhouse_async_insert", cfg.ClickHouseAsyncInsert,
 		"clickhouse_wait_for_async_insert", cfg.ClickHouseWaitForAsyncInsert,
 		"group_id", cfg.GroupID,

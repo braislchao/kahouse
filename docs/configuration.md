@@ -60,6 +60,7 @@ These fields have defaults for local development, but you will always set them e
 |-------|------|---------|-------------|
 | `clickhouse_max_open_conns` | int | `5` | Maximum number of open connections to ClickHouse. Must be >= 1. |
 | `clickhouse_max_idle_conns` | int | `5` | Maximum number of idle connections in the pool. Must be >= 1. |
+| `clickhouse_conn_max_lifetime_s` | int | `300` | Recycle pooled connections after this many seconds. ClickHouse Cloud closes idle connections server-side; the driver default (1h) is too long and causes `connection reset by peer` on stale connections. Keep below the server idle timeout. Must be >= 0 (0 = driver default). |
 | `clickhouse_async_insert` | bool | `false` | Enable ClickHouse async inserts (`async_insert=1`). |
 | `clickhouse_wait_for_async_insert` | bool | `false` | Wait for async insert to complete before returning (`wait_for_async_insert=1`). Only relevant when `clickhouse_async_insert` is `true`. |
 
@@ -268,7 +269,7 @@ kahouse validates the config at startup and exits with an error if any rule is v
 - `string_value_column` is required (globally or per-topic) when the resolved format is `string`.
 - `input_format` must be one of `avro`, `json`, or `string`.
 - `auto_offset_reset` must be one of `earliest`, `latest`, or `none`.
-- `clickhouse_max_open_conns` and `clickhouse_max_idle_conns` must be >= 1.
+- `clickhouse_max_open_conns` and `clickhouse_max_idle_conns` must be >= 1; `clickhouse_conn_max_lifetime_s` must be >= 0.
 - `kafka_session_timeout_ms` and `kafka_max_poll_interval_ms` must be > 0.
 - `batch_size` must be >= 1 (both global and per-topic).
 - `batch_delay_ms`, `max_retries`, `retry_backoff_ms` must be >= 0.
