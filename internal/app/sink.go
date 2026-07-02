@@ -187,13 +187,19 @@ func NewSinkTask(
 	// Each topic gets a unique consumer group for full offset isolation.
 	groupID := "kahouse-" + strings.TrimSpace(cfg.GroupID) + "-" + mapping.Topic
 	kafkaConfig := buildKafkaConfig(kafka.ConfigMap{
-		"bootstrap.servers":    cfg.KafkaBrokers,
-		"group.id":             groupID,
-		"client.id":            cfg.ClientID + "-" + mapping.Topic,
-		"auto.offset.reset":    cfg.AutoOffsetReset,
-		"enable.auto.commit":   false,
-		"session.timeout.ms":   cfg.KafkaSessionTimeoutMs,
-		"max.poll.interval.ms": cfg.KafkaMaxPollIntervalMs,
+		"bootstrap.servers":  cfg.KafkaBrokers,
+		"group.id":           groupID,
+		"client.id":          cfg.ClientID + "-" + mapping.Topic,
+		"auto.offset.reset":  cfg.AutoOffsetReset,
+		"enable.auto.commit": false,
+		"session.timeout.ms": cfg.KafkaSessionTimeoutMs,
+		// Cap librdkafka's internal prefetch queue. The defaults (100k msgs /
+		// 64MB) let RSS climb unbounded when the consumer is far behind, which
+		// OOMKills a memory-limited pod during backlog catch-up. We only ever
+		// need enough buffered to keep the next batch full.
+		"queued.min.messages":        20000, // ~2x the largest batch_size
+		"queued.max.messages.kbytes": 32768, // 32MB consumer queue (default 64MB)
+		"max.poll.interval.ms":       cfg.KafkaMaxPollIntervalMs,
 	}, cfg)
 
 	consumer, err := kafka.NewConsumer(&kafkaConfig)

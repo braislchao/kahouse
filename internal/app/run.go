@@ -38,6 +38,8 @@ func Run() {
 	}()
 	sugar := logger.Sugar()
 
+	applyMemoryLimit(sugar)
+
 	sugar.Infow("Loaded configuration", configLogFields(cfg)...)
 
 	ctx, cancel := context.WithCancel(context.Background())
