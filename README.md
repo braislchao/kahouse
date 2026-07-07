@@ -187,7 +187,8 @@ Operational endpoints for managing individual topics at runtime.
 # Check which topics are running
 curl http://localhost:9090/api/topics
 # -> [{"topic":"orders","table":"default.orders","status":"stopped","stop_reason":"crash","stop_class":"transient","repair_mode":""}, ...]
-# stop_reason is "operator" (admin API stop/restart or SIGTERM), "crash" (unexpected exit), or "" (running).
+# stop_reason is "operator" (admin API stop/restart or SIGTERM), "crash" (unexpected exit),
+#   "table_missing" (configured but never started because its target table did not validate), or "" (running).
 # stop_class refines a crash: "transient" (auto-restart eligible) or "fatal" (needs an operator); "" otherwise.
 
 # Start a stopped topic
