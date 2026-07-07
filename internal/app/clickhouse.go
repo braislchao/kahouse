@@ -103,23 +103,28 @@ func getTableColumns(ctx context.Context, chConn driver.Conn, table string) (Col
 	return cols, nil
 }
 
-// validateTables checks that all target tables exist and are accessible in ClickHouse.
-// It returns a TableColumns map with the column names for each table, which is used
-// to filter out Avro fields that don't have a matching ClickHouse column.
-func validateTables(ctx context.Context, chConn driver.Conn, tables []TopicTableMapping, sugar *zap.SugaredLogger) (TableColumns, error) {
+// validateTables checks which target tables exist and are accessible in ClickHouse.
+// It returns a TableColumns map with the column names for each table that validated,
+// which is used both to filter out Avro fields without a matching ClickHouse column
+// and to decide which sink tasks to start. Tables that fail validation (missing or
+// inaccessible) are logged as warnings and omitted from the map so a single missing
+// table does not take down the whole sink; the caller skips their tasks.
+func validateTables(ctx context.Context, chConn driver.Conn, tables []TopicTableMapping, sugar *zap.SugaredLogger) TableColumns {
 	tc := make(TableColumns, len(tables))
 	for _, mapping := range tables {
 		cols, err := getTableColumns(ctx, chConn, mapping.Table)
 		if err != nil {
-			return nil, fmt.Errorf("topic %s: %w", mapping.Topic, err)
+			sugar.Warnf("Skipping topic %s: table %q failed validation: %v", mapping.Topic, mapping.Table, err)
+			continue
 		}
 		if len(cols) == 0 {
-			return nil, fmt.Errorf("topic %s: table %q has no columns or does not exist", mapping.Topic, mapping.Table)
+			sugar.Warnf("Skipping topic %s: table %q has no columns or does not exist", mapping.Topic, mapping.Table)
+			continue
 		}
 		tc[mapping.Table] = cols
 		sugar.Infof("Validated table exists: %s -> %s (%d columns)", mapping.Topic, mapping.Table, len(cols))
 	}
-	return tc, nil
+	return tc
 }
 
 // batchTiming holds the duration of each phase inside writeBatch.
