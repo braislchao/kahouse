@@ -102,9 +102,9 @@ func Run() {
 	}
 	sugar.Info("Connected to ClickHouse")
 
-	tableColumns, err := validateTables(context.Background(), chConn, cfg.TopicTables, sugar)
-	if err != nil {
-		sugar.Fatalf("Table validation failed: %v", err)
+	tableColumns := validateTables(context.Background(), chConn, cfg.TopicTables, sugar)
+	if len(tableColumns) == 0 {
+		sugar.Fatal("No target tables validated; refusing to start with zero sink tasks")
 	}
 
 	// Shared DLQ producer

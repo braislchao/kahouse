@@ -131,10 +131,7 @@ func TestValidateTablesSuccess(t *testing.T) {
 		{Topic: "orders", Table: "default.orders"},
 		{Topic: "payments", Table: "default.payments"},
 	}
-	tc, err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
-	if err != nil {
-		t.Fatalf("Expected validateTables to succeed, got %v", err)
-	}
+	tc := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
 	if len(tc) != 2 {
 		t.Fatalf("Expected 2 table column sets, got %d", len(tc))
 	}
@@ -143,35 +140,36 @@ func TestValidateTablesSuccess(t *testing.T) {
 	}
 }
 
-func TestValidateTablesFailsOnMissingTable(t *testing.T) {
+func TestValidateTablesSkipsMissingTable(t *testing.T) {
 	conn := &stubConn{
+		columns: map[string][]stubColumn{
+			"payments": {{name: "id", colType: "String"}},
+		},
 		queryErr: map[string]error{
 			"orders": fmt.Errorf("table orders does not exist"),
 		},
 	}
 	tables := []TopicTableMapping{
 		{Topic: "orders", Table: "default.orders"},
+		{Topic: "payments", Table: "default.payments"},
 	}
-	_, err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
-	if err == nil {
-		t.Fatal("Expected validateTables to fail for missing table")
+	tc := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
+	if _, ok := tc["default.orders"]; ok {
+		t.Fatal("Expected missing table to be skipped, but it was included")
 	}
-	if !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("Expected 'does not exist' error, got %q", err.Error())
+	if _, ok := tc["default.payments"]; !ok {
+		t.Fatal("Expected valid table to still be validated when another is missing")
 	}
 }
 
-func TestValidateTablesRejectsInvalidTableName(t *testing.T) {
+func TestValidateTablesSkipsInvalidTableName(t *testing.T) {
 	conn := &stubConn{}
 	tables := []TopicTableMapping{
 		{Topic: "orders", Table: ""},
 	}
-	_, err := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
-	if err == nil {
-		t.Fatal("Expected validateTables to reject empty table name")
-	}
-	if !strings.Contains(err.Error(), "invalid table name") {
-		t.Fatalf("Expected 'invalid table name' error, got %q", err.Error())
+	tc := validateTables(context.Background(), conn, tables, zap.NewNop().Sugar())
+	if len(tc) != 0 {
+		t.Fatalf("Expected invalid table name to be skipped, got %d entries", len(tc))
 	}
 }
 
