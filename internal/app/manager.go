@@ -36,7 +36,7 @@ type TopicStatus struct {
 	Topic      string `json:"topic"`
 	Table      string `json:"table"`
 	Status     string `json:"status"`      // "running" or "stopped"
-	StopReason string `json:"stop_reason"` // "", "operator", or "crash"
+	StopReason string `json:"stop_reason"` // "", "operator", "crash", or "table_missing"
 	StopClass  string `json:"stop_class"`  // "", "transient", or "fatal" (only set for crashes)
 	RepairMode string `json:"repair_mode"` // "", "dlq", or "skip"
 }
@@ -57,6 +57,11 @@ type TaskManager struct {
 	logger       *zap.SugaredLogger
 	parentCtx    context.Context
 	tableColumns TableColumns
+	// skippedTables holds topics that were not started because their target table
+	// failed validation. They never enter tasks (so health/readiness ignore them),
+	// but the admin API surfaces them as stopped/table_missing so a configured-but-
+	// not-syncing table is visible instead of silently dropped.
+	skippedTables []TopicTableMapping
 }
 
 // NewTaskManager creates a TaskManager bound to the given parent context.
@@ -88,6 +93,7 @@ func (m *TaskManager) StartAll() error {
 	for _, mapping := range m.cfg.TopicTables {
 		if _, ok := m.tableColumns[mapping.Table]; !ok {
 			m.logger.Warnf("Skipping sink task for topic %s: table %q did not validate", mapping.Topic, mapping.Table)
+			m.skippedTables = append(m.skippedTables, mapping)
 			continue
 		}
 		if err := m.startTask(mapping); err != nil {
@@ -362,6 +368,16 @@ func (m *TaskManager) Topics() []TopicStatus {
 			StopReason: stopReason,
 			StopClass:  stopClass,
 			RepairMode: mt.task.GetRepairMode().String(),
+		})
+	}
+	// Topics configured but never started because their table did not validate.
+	// Surfaced as stopped/table_missing so they are visible in the admin API/TUI.
+	for _, mapping := range m.skippedTables {
+		result = append(result, TopicStatus{
+			Topic:      mapping.Topic,
+			Table:      mapping.Table,
+			Status:     "stopped",
+			StopReason: "table_missing",
 		})
 	}
 	return result

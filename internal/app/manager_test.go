@@ -124,6 +124,44 @@ func TestTaskManagerTopics(t *testing.T) {
 	}
 }
 
+func TestTaskManagerTopicsSurfacesSkippedTables(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runningTask := &SinkTask{mapping: TopicTableMapping{Topic: "payments", Table: "default.payments"}}
+	mgr := &TaskManager{
+		tasks:     make(map[string]*managedTask),
+		parentCtx: ctx,
+		logger:    zap.NewNop().Sugar(),
+		skippedTables: []TopicTableMapping{
+			{Topic: "orders", Table: "default.orders"},
+		},
+	}
+	mgr.tasks["payments"] = &managedTask{
+		task:    runningTask,
+		mapping: TopicTableMapping{Topic: "payments", Table: "default.payments"},
+		done:    make(chan struct{}),
+	}
+
+	statusByTopic := make(map[string]TopicStatus)
+	for _, ts := range mgr.Topics() {
+		statusByTopic[ts.Topic] = ts
+	}
+
+	skipped, ok := statusByTopic["orders"]
+	if !ok {
+		t.Fatal("Expected skipped topic 'orders' to be surfaced in Topics()")
+	}
+	if skipped.Status != "stopped" || skipped.StopReason != "table_missing" {
+		t.Fatalf("Expected orders stopped/table_missing, got %q/%q", skipped.Status, skipped.StopReason)
+	}
+
+	// A skipped table must NOT appear in the health snapshot, so readiness ignores it.
+	if len(mgr.Snapshot()) != 1 {
+		t.Fatalf("Expected only the started task in snapshot, got %d", len(mgr.Snapshot()))
+	}
+}
+
 func TestTaskManagerSnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
