@@ -134,9 +134,6 @@ type batchTiming struct {
 	Send    time.Duration
 }
 
-// unixEpoch is used to convert time.Time back to days-since-epoch for integer columns.
-var unixEpoch = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
-
 // isIntegerType returns true if the ClickHouse type (after stripping Nullable) is an integer type.
 func isIntegerType(chType string) bool {
 	// Strip Nullable wrapper
@@ -171,10 +168,10 @@ func isDateTimeType(chType string) bool {
 
 // coerceValue converts Go types that clickhouse-go cannot handle natively for
 // certain column types. Currently handles:
-//   - time.Time → int64 when the target column is an integer type. goavro decodes
-//     Avro logicalType "date" (int, days since epoch) as time.Time at midnight UTC.
-//     ClickHouse columns ALTERed from Date to Int64 (e.g. to handle overflow dates
-//     like year 3029) cannot accept time.Time via the native protocol driver.
+//   - time.Time → int64 (epoch-milliseconds) when the target column is an integer type.
+//     ClickHouse columns ALTERed from Date/DateTime to Int64 (e.g. to hold overflow dates
+//     like year 3029) cannot accept time.Time via the native protocol driver, so we encode
+//     the instant as epoch-ms. See the integer branch below for why ms (not days).
 //   - string (RFC3339/ISO8601) → time.Time when the target column is a DateTime-family
 //     type. clickhouse-go's native protocol rejects RFC3339 strings (with "T" separator)
 //     but accepts time.Time natively for DateTime/DateTime64 columns.
@@ -205,20 +202,21 @@ func coerceValue(val interface{}, chType string) interface{} {
 		// Date, Date32, DateTime, DateTime64 — driver handles time.Time natively.
 		return val
 	}
-	// Convert time.Time to days-since-epoch (preserves the original Avro int value).
-	// goavro creates midnight-UTC time.Time for logicalType "date", so this is lossless.
-	// Use integer division on seconds to avoid float64 precision loss on large values
-	// and to correctly handle dates before 1970 (negative day counts).
-	if t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {
-		const secsPerDay = 86400
-		secs := int64(t.Sub(unixEpoch).Seconds())
-		days := secs / secsPerDay
-		if secs%secsPerDay != 0 && secs < 0 {
-			days-- // floor division for negative values
-		}
-		return days
-	}
-	// For timestamp-millis/micros (non-midnight), return unix milliseconds.
+	// Emit epoch-milliseconds for every temporal value written to an integer column.
+	//
+	// goavro decodes BOTH Avro logicalType "date" (days since epoch) and
+	// "timestamp-millis"/"timestamp-micros" (an instant) into time.Time, erasing the
+	// distinction. We must therefore pick ONE integer encoding, and it has to be epoch-ms:
+	// that is the contract every downstream ClickHouse consumer was built against, and it
+	// matches the Confluent kafka-connect ClickHouse sink (e.g. consumers do `toDate(col / 1000)`).
+	//
+	// The earlier "midnight UTC -> days-since-epoch, otherwise -> milliseconds" heuristic was
+	// ambiguous and produced a mixed encoding no consumer could read: a real date and a timestamp
+	// that happens to land on 00:00:00 are indistinguishable once decoded, so date fields (and any
+	// midnight timestamp) were written as days while non-midnight timestamps were written as ms.
+	// e.g. a leave start-date became 17114 instead of 1478649600000 and was silently dropped by
+	// `toDate(col / 1000)`. epoch-ms fits Int64 for any realistic year, so there is no overflow
+	// reason to prefer days.
 	return t.UnixMilli()
 }
 

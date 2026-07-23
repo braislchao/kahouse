@@ -61,62 +61,51 @@ func TestNormalizeAvroValueKeepsRegularObjects(t *testing.T) {
 	}
 }
 
-func TestCoerceValueDateToInt64(t *testing.T) {
+func TestCoerceValueTemporalToInt64EmitsMillis(t *testing.T) {
+	// A midnight date (Avro logicalType "date", decoded by goavro to a midnight-UTC time.Time)
+	// written to an Int64 column must be encoded as epoch-MILLISECONDS — the contract downstream
+	// consumers rely on (matching the Confluent kafka-connect ClickHouse sink) — NOT days-since-epoch.
 	dateVal := time.Date(2024, 4, 12, 0, 0, 0, 0, time.UTC)
-	expected := int64(19825) // 2024-04-12 is 19825 days since epoch
+	expected := dateVal.UnixMilli() // 1712880000000, not 19825 days
 
 	got := coerceValue(dateVal, "Int64")
-	days, ok := got.(int64)
+	ms, ok := got.(int64)
 	if !ok {
 		t.Fatalf("Expected int64 for Int64 column, got %T (%v)", got, got)
 	}
-	if days != expected {
-		t.Fatalf("Expected %d days since epoch, got %d", expected, days)
+	if ms != expected {
+		t.Fatalf("Expected %d epoch-ms, got %d", expected, ms)
 	}
 
-	got2 := coerceValue(dateVal, "Nullable(Int64)")
-	days2, ok := got2.(int64)
-	if !ok {
-		t.Fatalf("Expected int64 for Nullable(Int64) column, got %T (%v)", got2, got2)
-	}
-	if days2 != expected {
-		t.Fatalf("Expected %d days, got %d", expected, days2)
+	if got2, _ := coerceValue(dateVal, "Nullable(Int64)").(int64); got2 != expected {
+		t.Fatalf("Expected %d epoch-ms for Nullable(Int64), got %d", expected, got2)
 	}
 
-	got3 := coerceValue(dateVal, "Date")
-	if _, ok := got3.(time.Time); !ok {
-		t.Fatalf("Expected time.Time for Date column, got %T (%v)", got3, got3)
+	// Date-family columns still receive time.Time (driver handles them natively).
+	if _, ok := coerceValue(dateVal, "Date").(time.Time); !ok {
+		t.Fatalf("Expected time.Time for Date column")
+	}
+	if _, ok := coerceValue(dateVal, "Nullable(Date32)").(time.Time); !ok {
+		t.Fatalf("Expected time.Time for Nullable(Date32) column")
 	}
 
-	got4 := coerceValue(dateVal, "Nullable(Date32)")
-	if _, ok := got4.(time.Time); !ok {
-		t.Fatalf("Expected time.Time for Nullable(Date32) column, got %T (%v)", got4, got4)
+	// Regression for the removed midnight heuristic: a timestamp that lands exactly on 00:00:00
+	// must NOT be misread as a date. 2016-11-09 00:00:00 UTC -> epoch-ms, not 17114 days.
+	midnightTS := time.Date(2016, 11, 9, 0, 0, 0, 0, time.UTC)
+	if got := coerceValue(midnightTS, "Int64").(int64); got != midnightTS.UnixMilli() {
+		t.Fatalf("Midnight timestamp must be epoch-ms (%d), got %d", midnightTS.UnixMilli(), got)
 	}
 
-	// Pre-1970 date: 1960-06-15 is -3488 days since epoch.
+	// Pre-1970 date -> negative epoch-ms.
 	pre1970 := time.Date(1960, 6, 15, 0, 0, 0, 0, time.UTC)
-	got5 := coerceValue(pre1970, "Int64")
-	days5, ok := got5.(int64)
-	if !ok {
-		t.Fatalf("Expected int64 for pre-1970 date, got %T (%v)", got5, got5)
-	}
-	if days5 >= 0 {
-		t.Fatalf("Expected negative days for pre-1970 date, got %d", days5)
-	}
-	roundTrip := unixEpoch.AddDate(0, 0, int(days5))
-	if !roundTrip.Equal(pre1970) {
-		t.Fatalf("Round-trip failed: expected %v, got %v (days=%d)", pre1970, roundTrip, days5)
+	if got := coerceValue(pre1970, "Int64").(int64); got != pre1970.UnixMilli() || got >= 0 {
+		t.Fatalf("Expected negative epoch-ms %d for pre-1970 date, got %d", pre1970.UnixMilli(), got)
 	}
 
-	// Unix epoch itself should be 0.
+	// Unix epoch itself -> 0.
 	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
-	got6 := coerceValue(epoch, "Int64")
-	days6, ok := got6.(int64)
-	if !ok {
-		t.Fatalf("Expected int64 for epoch, got %T (%v)", got6, got6)
-	}
-	if days6 != 0 {
-		t.Fatalf("Expected 0 days for epoch, got %d", days6)
+	if got := coerceValue(epoch, "Int64").(int64); got != 0 {
+		t.Fatalf("Expected 0 epoch-ms for unix epoch, got %d", got)
 	}
 }
 
